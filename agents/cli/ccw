@@ -287,6 +287,63 @@ cmd_list() {
   done
 }
 
+# ─── ccw ssh ──────────────────────────────────────────────────────────────────
+cmd_ssh() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: ccw ssh <task>"
+    echo ""
+    echo "Attach to the Claude tmux session in the task pod."
+    echo "Detach with Ctrl+B D."
+    return 0
+  fi
+
+  local task="${1:-}"
+  [[ -n "$task" ]] || die "usage: ccw ssh <task>"
+
+  require_cmd kubectl
+
+  kubectl get pod -n claude-workers "$task" >/dev/null 2>&1 \
+    || die "task not found: ${task}"
+
+  echo "Attaching to Claude's tmux session. Detach with Ctrl+B D."
+
+  # Check if the tmux session exists before attaching
+  if ! kubectl exec -n claude-workers "$task" -- tmux has-session -t claude 2>/dev/null; then
+    echo ""
+    echo "Claude's tmux session no longer exists (Claude may have finished)."
+    printf "Open a bash shell instead? [y/N] "
+    read -r answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+      echo "Opening bash shell."
+      kubectl exec -it -n claude-workers "$task" -- bash
+    fi
+    return 0
+  fi
+
+  kubectl exec -it -n claude-workers "$task" -- tmux attach -t claude
+}
+
+# ─── ccw shell ────────────────────────────────────────────────────────────────
+cmd_shell() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: ccw shell <task>"
+    echo ""
+    echo "Open a bash shell in the task pod."
+    return 0
+  fi
+
+  local task="${1:-}"
+  [[ -n "$task" ]] || die "usage: ccw shell <task>"
+
+  require_cmd kubectl
+
+  kubectl get pod -n claude-workers "$task" >/dev/null 2>&1 \
+    || die "task not found: ${task}"
+
+  echo "Opening bash shell. Claude is running in tmux session 'claude'."
+  kubectl exec -it -n claude-workers "$task" -- bash
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
   usage
@@ -301,7 +358,9 @@ case "$subcommand" in
   --help|-h)   usage ;;
   list)        cmd_list "$@" ;;
   status)      cmd_status "$@" ;;
-  ssh|shell|logs|stop|dismiss|dismiss-all)
+  ssh)         cmd_ssh "$@" ;;
+  shell)       cmd_shell "$@" ;;
+  logs|stop|dismiss|dismiss-all)
     die "subcommand '${subcommand}' is not yet implemented" ;;
   *)
     die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
