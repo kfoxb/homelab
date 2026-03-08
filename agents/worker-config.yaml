@@ -10,3 +10,5 @@ data:
   # How long to wait (in minutes) before retrying after a rate limit hit.
   # 300 minutes (5 hours) matches Claude's rolling usage window.
   rateLimitCooldownMinutes: "300"
+  # Pods in terminal states (done, error, stopped) older than this are deleted by the nightly cleanup CronJob.
+  podTTLHours: "48"

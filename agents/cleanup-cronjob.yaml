@@ -1,0 +1,114 @@
+---
+# ServiceAccount for the cleanup job (separate from claude-worker)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: claude-cleanup
+  namespace: claude-workers
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: claude-cleanup
+  namespace: claude-workers
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: claude-cleanup
+  namespace: claude-workers
+subjects:
+  - kind: ServiceAccount
+    name: claude-cleanup
+    namespace: claude-workers
+roleRef:
+  kind: Role
+  name: claude-cleanup
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: claude-cleanup
+  namespace: claude-workers
+spec:
+  schedule: "0 3 * * *"  # 3am daily
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: claude-cleanup
+          restartPolicy: OnFailure
+          containers:
+            - name: cleanup
+              image: bitnami/kubectl:latest
+              env:
+                # Set CLEANUP_DRY_RUN=true to log what would be deleted without actually deleting.
+                - name: CLEANUP_DRY_RUN
+                  value: "false"
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+
+                  NAMESPACE="claude-workers"
+                  TERMINAL_STATUSES="done error stopped"
+
+                  # Read TTL from ConfigMap; fall back to 48h if key is absent.
+                  TTL_HOURS=$(kubectl get configmap worker-config -n "$NAMESPACE" \
+                    -o jsonpath='{.data.podTTLHours}' 2>/dev/null || echo "48")
+                  # Strip non-numeric characters just in case
+                  TTL_HOURS=$(echo "$TTL_HOURS" | tr -cd '0-9')
+                  if [ -z "$TTL_HOURS" ]; then
+                    TTL_HOURS=48
+                  fi
+
+                  echo "Cleanup starting — TTL: ${TTL_HOURS}h, dry-run: ${CLEANUP_DRY_RUN}"
+
+                  NOW_EPOCH=$(date -u +%s)
+
+                  # List all pods with the claude-worker label, output name and creationTimestamp
+                  kubectl get pods -n "$NAMESPACE" -l app=claude-worker \
+                    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\t"}{.metadata.labels.status}{"\n"}{end}' \
+                  | while IFS=$'\t' read -r POD_NAME CREATED_AT STATUS; do
+                    [ -z "$POD_NAME" ] && continue
+
+                    # Skip pods whose status is not in the terminal set
+                    if [[ ! "$STATUS" =~ ^(done|error|stopped)$ ]]; then
+                      echo "Skipping $POD_NAME (status: ${STATUS:-<none>})"
+                      continue
+                    fi
+
+                    # Compute age in hours
+                    CREATED_EPOCH=$(date -u -d "$CREATED_AT" +%s 2>/dev/null || echo "0")
+                    if [ "$CREATED_EPOCH" -eq 0 ]; then
+                      echo "WARNING: could not parse creationTimestamp for $POD_NAME, skipping"
+                      continue
+                    fi
+                    AGE_SECONDS=$(( NOW_EPOCH - CREATED_EPOCH ))
+                    AGE_HOURS=$(( AGE_SECONDS / 3600 ))
+
+                    if [ "$AGE_HOURS" -gt "$TTL_HOURS" ]; then
+                      if [ "${CLEANUP_DRY_RUN}" = "true" ]; then
+                        echo "DRY-RUN: would delete $POD_NAME (age: ${AGE_HOURS}h, status: $STATUS)"
+                      else
+                        echo "Deleting $POD_NAME (age: ${AGE_HOURS}h, status: $STATUS)"
+                        kubectl delete pod "$POD_NAME" -n "$NAMESPACE"
+                      fi
+                    else
+                      echo "Keeping $POD_NAME (age: ${AGE_HOURS}h < TTL ${TTL_HOURS}h, status: $STATUS)"
+                    fi
+                  done
+
+                  echo "Cleanup complete."
