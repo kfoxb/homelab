@@ -22,6 +22,7 @@ Subcommands:
   stop        Gracefully stop a running task
   dismiss     Delete a task pod
   dismiss-all Delete all task pods
+  queue       Show queue status and manage concurrency
 
 Run 'ccw <subcommand> --help' for subcommand-specific options.
 EOF
@@ -551,6 +552,164 @@ cmd_stop_all() {
   done
 }
 
+# ─── ccw queue ────────────────────────────────────────────────────────────────
+
+# format_duration <seconds> → "2h 15m" / "45m" / "30s"
+format_duration() {
+  local secs="$1"
+  if (( secs <= 0 )); then
+    echo "now"
+  elif (( secs < 60 )); then
+    echo "${secs}s"
+  elif (( secs < 3600 )); then
+    echo "$(( secs / 60 ))m"
+  else
+    local h=$(( secs / 3600 ))
+    local m=$(( (secs % 3600) / 60 ))
+    if (( m > 0 )); then
+      echo "${h}h ${m}m"
+    else
+      echo "${h}h"
+    fi
+  fi
+}
+
+cmd_queue() {
+  local subcmd="${1:-}"
+
+  case "$subcmd" in
+    --help|-h)
+      cat <<EOF
+Usage: ccw queue [set-limit <n> | promote <task>]
+
+  ccw queue               Show running/queued/rate-limited counts
+  ccw queue set-limit <n> Update maxConcurrent in the worker-config ConfigMap
+  ccw queue promote <task> Immediately release a queued task (bypass ordering)
+EOF
+      return 0 ;;
+    set-limit)
+      shift
+      cmd_queue_set_limit "$@" ;;
+    promote)
+      shift
+      cmd_queue_promote "$@" ;;
+    "")
+      cmd_queue_status ;;
+    *)
+      die "unknown queue subcommand '${subcmd}'. Run 'ccw queue --help' for usage." ;;
+  esac
+}
+
+cmd_queue_status() {
+  require_cmd kubectl
+  require_cmd jq
+
+  # ── Fetch ConfigMap for limit
+  local max_concurrent
+  max_concurrent="$(kubectl get configmap worker-config -n claude-workers \
+    -o jsonpath='{.data.maxConcurrent}' 2>/dev/null)" || max_concurrent="?"
+
+  # ── Fetch all worker pods
+  local pods_json
+  pods_json="$(kubectl get pods -n claude-workers -l app=claude-worker -o json 2>/dev/null)" \
+    || die "failed to query pods (is kubectl configured?)"
+
+  local now
+  now="$(date +%s)"
+
+  # ── Count pods by status
+  local running_count queued_count rate_limited_count
+  running_count="$(echo "$pods_json" | jq '[.items[] | select(.metadata.labels.status == "running")] | length')"
+  queued_count="$(echo "$pods_json" | jq '[.items[] | select(.metadata.labels.status == "queued")] | length')"
+  rate_limited_count="$(echo "$pods_json" | jq '[.items[] | select(.metadata.labels.status == "rate-limited")] | length')"
+
+  # ── Find earliest retry time among rate-limited pods
+  local earliest_retry="" retry_in=""
+  while IFS= read -r retry_ts; do
+    [[ -z "$retry_ts" || "$retry_ts" == "null" ]] && continue
+    if [[ -z "$earliest_retry" || "$retry_ts" -lt "$earliest_retry" ]]; then
+      earliest_retry="$retry_ts"
+    fi
+  done < <(echo "$pods_json" | jq -r '.items[] | select(.metadata.labels.status == "rate-limited") | .metadata.annotations["ccw/retry-after"] // empty')
+
+  if [[ -n "$earliest_retry" ]]; then
+    local secs_until=$(( earliest_retry - now ))
+    retry_in="$(format_duration "$secs_until")"
+  fi
+
+  # ── Print summary
+  echo "Queue Status"
+
+  # Running line: show "at limit" if at or above limit
+  if [[ "$max_concurrent" =~ ^[0-9]+$ && "$running_count" -ge "$max_concurrent" ]]; then
+    printf "  Running:      %s/%s (at limit)\n" "$running_count" "$max_concurrent"
+  else
+    printf "  Running:      %s/%s\n" "$running_count" "$max_concurrent"
+  fi
+
+  printf "  Queued:       %s\n" "$queued_count"
+
+  if [[ "$rate_limited_count" -gt 0 && -n "$retry_in" ]]; then
+    printf "  Rate-limited: %s (retry in %s)\n" "$rate_limited_count" "$retry_in"
+  else
+    printf "  Rate-limited: %s\n" "$rate_limited_count"
+  fi
+
+  # ── List queued tasks (oldest first)
+  if [[ "$queued_count" -eq 0 ]]; then
+    return 0
+  fi
+
+  echo ""
+  echo "Queued tasks (oldest first):"
+
+  # Sort queued pods by creationTimestamp ascending
+  echo "$pods_json" | jq -r '
+    [.items[] | select(.metadata.labels.status == "queued")]
+    | sort_by(.metadata.creationTimestamp)
+    | .[]
+    | [.metadata.name, (.metadata.labels.branch // "-"), .metadata.creationTimestamp]
+    | @tsv
+  ' | while IFS=$'\t' read -r name branch created_at; do
+    local age
+    age="$(format_age "$created_at")"
+    printf "  %-30s %-20s queued %s\n" "$name" "$branch" "$age"
+  done
+}
+
+cmd_queue_set_limit() {
+  local n="${1:-}"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "usage: ccw queue set-limit <n>"
+  [[ "$n" -ge 1 ]] || die "limit must be at least 1"
+
+  require_cmd kubectl
+
+  kubectl patch configmap worker-config -n claude-workers \
+    --patch "{\"data\":{\"maxConcurrent\":\"${n}\"}}"
+
+  echo "maxConcurrent updated to ${n}"
+}
+
+cmd_queue_promote() {
+  local task="${1:-}"
+  [[ -n "$task" ]] || die "usage: ccw queue promote <task>"
+
+  require_cmd kubectl
+
+  kubectl get pod -n claude-workers "$task" >/dev/null 2>&1 \
+    || die "task not found: ${task}"
+
+  local status
+  status="$(kubectl get pod -n claude-workers "$task" \
+    -o jsonpath='{.metadata.labels.status}' 2>/dev/null)"
+
+  [[ "$status" == "queued" ]] || die "task '${task}' is not queued (status: ${status})"
+
+  kubectl label pod -n claude-workers "$task" status=running --overwrite >/dev/null
+
+  echo "Promoted ${task} to running"
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
   usage
@@ -572,6 +731,7 @@ case "$subcommand" in
   stop-all)    cmd_stop_all "$@" ;;
   dismiss)     cmd_dismiss "$@" ;;
   dismiss-all) cmd_dismiss_all "$@" ;;
+  queue)       cmd_queue "$@" ;;
   *)
     die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
 esac
