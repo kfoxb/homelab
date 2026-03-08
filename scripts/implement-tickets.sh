@@ -360,8 +360,16 @@ implement_ticket() {
   # Sync remotes so branch_exists checks are accurate
   git -C "$REPO_ROOT" fetch origin --quiet
 
+  # Resolve the start point for the new branch. Ticket branches may only exist
+  # on remote (e.g. usage ran out before the next run), so prefer origin/<branch>
+  # over the local ref to avoid "is not a commit" errors.
+  local checkout_from="$base_branch"
+  if [[ "$base_branch" != "$MAIN_BRANCH" ]]; then
+    checkout_from="origin/$base_branch"
+  fi
+
   # Create ticket branch from base
-  git -C "$REPO_ROOT" checkout -b "$branch" "$base_branch"
+  git -C "$REPO_ROOT" checkout -b "$branch" "$checkout_from"
 
   # Run Claude
   run_claude "$phase_dir" "$ticket_json"
