@@ -65,6 +65,10 @@ _shutdown() {
 }
 trap _shutdown SIGTERM
 
+# ─── Start status monitor ─────────────────────────────────────────────────────
+/usr/local/bin/status-monitor.sh &
+STATUS_MONITOR_PID=$!
+
 # ─── Claude launch script ─────────────────────────────────────────────────────
 # Written once; called by each tmux session. Reads the current prompt from a
 # control file and uses --resume if a session ID file is present.
@@ -116,7 +120,7 @@ while true; do
     echo "Starting Claude Code with initial prompt..."
   fi
 
-  rm -f /tmp/claude-exit-code
+  rm -f /tmp/claude-exit-code /tmp/claude-done
 
   # Start Claude in a tmux session so humans can exec in and observe
   tmux new-session -d -s claude /tmp/claude-launch.sh
