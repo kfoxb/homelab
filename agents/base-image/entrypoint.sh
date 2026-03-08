@@ -8,6 +8,16 @@ if [[ -n "${GITHUB_TOKEN:-}" ]]; then
   chmod 600 ~/.git-credentials
 fi
 
+# ─── Wait for scheduler to release this pod ──────────────────────────────────
+echo "Waiting for queue release..."
+while true; do
+  STATUS=$(kubectl get pod "$HOSTNAME" -n "${POD_NAMESPACE:-claude-workers}" \
+    -o jsonpath='{.metadata.labels.status}' 2>/dev/null)
+  [ "$STATUS" = "running" ] && break
+  sleep 5
+done
+echo "Released by scheduler, starting work..."
+
 # ─── Clone repo ───────────────────────────────────────────────────────────────
 echo "Cloning ${REPO_URL} ..."
 git clone "${REPO_URL}" /workspace
