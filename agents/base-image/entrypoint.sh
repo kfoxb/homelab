@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SESSION_ID_FILE=/tmp/claude-session-id
+INITIAL_PROMPT_FILE=/tmp/claude-initial-prompt
+
 # ─── Git credentials ─────────────────────────────────────────────────────────
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
   git config --global credential.helper store
@@ -40,13 +43,18 @@ if [[ -n "${CLAUDE_PROMPT_FILE:-}" && -f "${CLAUDE_PROMPT_FILE}" ]]; then
   cp "${CLAUDE_PROMPT_FILE}" /workspace/CLAUDE.md
 fi
 
+# ─── Save initial prompt for session resume fallback ──────────────────────────
+INITIAL_PROMPT=""
+if [[ -n "${CLAUDE_PROMPT_FILE:-}" && -f "${CLAUDE_PROMPT_FILE}" ]]; then
+  INITIAL_PROMPT=$(cat "${CLAUDE_PROMPT_FILE}")
+fi
+printf '%s' "${INITIAL_PROMPT}" > "${INITIAL_PROMPT_FILE}"
+
 # ─── SIGTERM handler ──────────────────────────────────────────────────────────
 _shutdown() {
   echo "SIGTERM received — shutting down Claude gracefully"
-  # Send SIGTERM to tmux session if it still exists
   if tmux has-session -t claude 2>/dev/null; then
     tmux send-keys -t claude C-c 2>/dev/null || true
-    # Give Claude up to 25 seconds to finish before killing
     for i in $(seq 1 25); do
       tmux has-session -t claude 2>/dev/null || break
       sleep 1
@@ -57,16 +65,63 @@ _shutdown() {
 }
 trap _shutdown SIGTERM
 
-# ─── Start Claude in a tmux session ──────────────────────────────────────────
-echo "Starting Claude Code in tmux session 'claude' ..."
-tmux new-session -d -s claude \
-  "set -o pipefail; claude --dangerously-skip-permissions --output-format stream-json 2>&1 | tee /workspace/.claude-output.log; echo \$? > /tmp/claude-exit-code"
+# ─── Claude launch script ─────────────────────────────────────────────────────
+# Written once; called by each tmux session. Reads the current prompt from a
+# control file and uses --resume if a session ID file is present.
+cat > /tmp/claude-launch.sh << 'LAUNCHEOF'
+#!/usr/bin/env bash
+# No set -e here so the exit code below is always reached.
+set -o pipefail
 
-# ─── Background monitor ───────────────────────────────────────────────────────
-# Polls until the tmux session exits, then writes /tmp/claude-done and
-# updates the pod's status label via kubectl.
-_monitor() {
-  # Wait for tmux session to disappear
+SESSION_ID_FILE=/tmp/claude-session-id
+PROMPT=$(cat /tmp/claude-current-prompt.txt)
+
+RESUME_ARGS=()
+if [[ -f "${SESSION_ID_FILE}" ]]; then
+  SESSION_ID=$(cat "${SESSION_ID_FILE}")
+  RESUME_ARGS=(--resume "${SESSION_ID}")
+fi
+
+# Run Claude, piping output through the session ID extractor then to the log.
+# The init event arrives within seconds of startup and contains the session_id.
+claude --dangerously-skip-permissions \
+  "${RESUME_ARGS[@]}" \
+  --output-format stream-json \
+  "${PROMPT}" 2>&1 | \
+  while IFS= read -r line; do
+    if echo "${line}" | jq -e '.subtype == "init"' >/dev/null 2>&1; then
+      echo "${line}" | jq -r '.session_id' > "${SESSION_ID_FILE}"
+    fi
+    echo "${line}"
+  done | tee /workspace/.claude-output.log
+
+# Capture pipeline exit code (claude's exit code with pipefail).
+echo $? > /tmp/claude-exit-code
+LAUNCHEOF
+chmod +x /tmp/claude-launch.sh
+
+# ─── Main work loop ───────────────────────────────────────────────────────────
+# Runs Claude, detects rate limits, and resumes after scheduler cooldown.
+while true; do
+  # Determine whether to resume an existing session or start fresh
+  IS_RESUME=false
+  if [[ -f "${SESSION_ID_FILE}" ]]; then
+    SESSION_ID=$(cat "${SESSION_ID_FILE}")
+    printf 'Continue where you left off.' > /tmp/claude-current-prompt.txt
+    IS_RESUME=true
+    echo "Resuming Claude session ${SESSION_ID}..."
+    # TODO(4.3): log RESUMED event to /workspace/.claude-events.log
+  else
+    cp "${INITIAL_PROMPT_FILE}" /tmp/claude-current-prompt.txt
+    echo "Starting Claude Code with initial prompt..."
+  fi
+
+  rm -f /tmp/claude-exit-code
+
+  # Start Claude in a tmux session so humans can exec in and observe
+  tmux new-session -d -s claude /tmp/claude-launch.sh
+
+  # Wait for the tmux session (and Claude) to exit
   while tmux has-session -t claude 2>/dev/null; do
     sleep 5
   done
@@ -78,7 +133,7 @@ _monitor() {
 
   echo "${EXIT_CODE}" > /tmp/claude-done
 
-  # Check output log for rate limit signals (case-insensitive)
+  # ── Rate limit detection ────────────────────────────────────────────────────
   RATE_LIMITED=false
   if [[ -f /workspace/.claude-output.log ]]; then
     if grep -qiE "rate.?limit|usage.?limit|too many requests|overloaded" \
@@ -88,8 +143,6 @@ _monitor() {
   fi
 
   if [[ "${RATE_LIMITED}" == "true" ]]; then
-    STATUS="rate-limited"
-    # Read cooldown from worker-config, default 300 minutes (5 hours)
     COOLDOWN=$(kubectl get configmap worker-config \
       -n "${POD_NAMESPACE:-claude-workers}" \
       -o jsonpath='{.data.rateLimitCooldownMinutes}' 2>/dev/null || echo "300")
@@ -100,6 +153,36 @@ _monitor() {
       "ccw/retry-after=${RETRY_AFTER}" \
       --overwrite 2>/dev/null || \
       echo "Warning: could not annotate pod"
+    kubectl label pod "${HOSTNAME}" \
+      -n "${POD_NAMESPACE:-claude-workers}" \
+      "status=rate-limited" \
+      --overwrite 2>/dev/null || \
+      echo "Warning: could not update pod label"
+
+    # Block until the scheduler resets our label to "running" after cooldown
+    echo "Waiting for scheduler to release pod after rate limit cooldown..."
+    while true; do
+      CURRENT_STATUS=$(kubectl get pod "$HOSTNAME" \
+        -n "${POD_NAMESPACE:-claude-workers}" \
+        -o jsonpath='{.metadata.labels.status}' 2>/dev/null)
+      [ "${CURRENT_STATUS}" = "running" ] && break
+      sleep 30
+    done
+    echo "Re-released by scheduler, resuming work..."
+    # Loop back — session ID file is still present so Claude will --resume
+    continue
+
+  elif [[ "${EXIT_CODE}" -ne 0 && "${IS_RESUME}" == "true" ]]; then
+    # Non-zero exit during a resume attempt likely means invalid/expired session.
+    # Fall back to a fresh start with the original prompt.
+    echo "Session resume failed (exit ${EXIT_CODE}) — falling back to fresh start"
+    rm -f "${SESSION_ID_FILE}"
+    kubectl label pod "${HOSTNAME}" \
+      -n "${POD_NAMESPACE:-claude-workers}" \
+      "status=running" \
+      --overwrite 2>/dev/null || true
+    continue
+
   elif [[ "${EXIT_CODE}" -eq 0 ]]; then
     STATUS="done"
   else
@@ -107,17 +190,14 @@ _monitor() {
   fi
 
   echo "Claude exited with code ${EXIT_CODE} — updating pod label status=${STATUS}"
-
-  # Update own pod label; HOSTNAME is the pod name in Kubernetes
   kubectl label pod "${HOSTNAME}" \
     -n "${POD_NAMESPACE:-claude-workers}" \
     "status=${STATUS}" \
     --overwrite 2>/dev/null || \
     echo "Warning: could not update pod label (kubectl may not be available)"
-}
 
-_monitor &
-MONITOR_PID=$!
+  break
+done
 
 # ─── Keep container alive ─────────────────────────────────────────────────────
 # Pod stays up after Claude finishes so humans can exec in and inspect.
