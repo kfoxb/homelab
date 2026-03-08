@@ -160,15 +160,6 @@ while true; do
 
   echo "${EXIT_CODE}" > /tmp/claude-done
 
-  # ── Follow-up queue ─────────────────────────────────────────────────────────
-  # Log if ccw follow-up queued a prompt while Claude was running.
-  # Queue consumption and re-launch are handled by ticket 4.4.
-  if [[ -f /tmp/follow-up-queue ]]; then
-    FOLLOW_UP_PROMPT=$(cat /tmp/follow-up-queue)
-    PREVIEW="${FOLLOW_UP_PROMPT:0:80}"
-    log_event "FOLLOW_UP prompt=\"${PREVIEW}\""
-  fi
-
   # ── Rate limit detection ────────────────────────────────────────────────────
   RATE_LIMITED=false
   if [[ -f /workspace/.claude-output.log ]]; then
@@ -225,6 +216,21 @@ while true; do
     STATUS="done"
   else
     STATUS="error"
+  fi
+
+  # ── Follow-up queue: if ccw follow-up wrote a prompt while Claude was running,
+  # consume it now and loop back to re-launch Claude with that prompt.
+  if [[ -f /tmp/follow-up-queue ]]; then
+    FOLLOW_UP_PROMPT=$(cat /tmp/follow-up-queue)
+    rm -f /tmp/follow-up-queue
+    PREVIEW="${FOLLOW_UP_PROMPT:0:80}"
+    log_event "FOLLOW_UP prompt=\"${PREVIEW}\""
+    printf '%s' "${FOLLOW_UP_PROMPT}" > /tmp/claude-current-prompt.txt
+    kubectl label pod "${HOSTNAME}" \
+      -n "${POD_NAMESPACE:-claude-workers}" \
+      "status=running" \
+      --overwrite 2>/dev/null || true
+    continue
   fi
 
   echo "Claude exited with code ${EXIT_CODE} — updating pod label status=${STATUS}"

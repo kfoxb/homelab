@@ -23,6 +23,7 @@ Subcommands:
   dismiss     Delete a task pod
   dismiss-all Delete all task pods
   queue       Show queue status and manage concurrency
+  follow-up   Send a follow-up message to a Claude session
 
 Run 'ccw <subcommand> --help' for subcommand-specific options.
 EOF
@@ -710,6 +711,112 @@ cmd_queue_promote() {
   echo "Promoted ${task} to running"
 }
 
+# ─── ccw follow-up ────────────────────────────────────────────────────────────
+cmd_follow_up() {
+  local task="" prompt=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prompt)  prompt="$2"; shift 2 ;;
+      --help|-h)
+        cat <<EOF
+Usage: ccw follow-up <task> [--prompt] <text>
+
+Send a follow-up message to a Claude session.
+
+Behavior by pod status:
+  waiting-input   Sends text directly to Claude's interactive tmux prompt
+  running         Queues text; delivered after Claude finishes current response
+  done / stopped  Resumes Claude with --resume and the follow-up as the new prompt
+  error / rate-limited / queued
+                  Prints an explanatory error
+
+Options:
+  --prompt <text>  Follow-up message (can also be given as a positional argument)
+EOF
+        return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        if [[ -z "$task" ]]; then
+          task="$1"; shift
+        elif [[ -z "$prompt" ]]; then
+          prompt="$1"; shift
+        else
+          die "unexpected argument: $1"
+        fi ;;
+    esac
+  done
+
+  [[ -n "$task" ]]   || die "usage: ccw follow-up <task> [--prompt] <text>"
+  [[ -n "$prompt" ]] || die "a follow-up message is required"
+
+  require_cmd kubectl
+
+  kubectl get pod -n claude-workers "$task" >/dev/null 2>&1 \
+    || die "task not found: ${task}"
+
+  local status
+  status="$(kubectl get pod -n claude-workers "$task" \
+    -o jsonpath='{.metadata.labels.status}' 2>/dev/null)"
+
+  case "$status" in
+    waiting-input)
+      # Send directly to the tmux interactive prompt.
+      # Pipe the prompt via stdin to avoid shell-quoting issues with special chars.
+      printf '%s' "$prompt" | kubectl exec -i -n claude-workers "$task" -- \
+        bash -c 'msg=$(cat); tmux send-keys -t claude "$msg" Enter'
+      echo "Follow-up sent to waiting Claude."
+      ;;
+
+    running)
+      # Queue for after Claude finishes its current response.
+      # The entrypoint picks up /tmp/follow-up-queue at the end of each Claude run.
+      printf '%s\n' "$prompt" | kubectl exec -i -n claude-workers "$task" -- \
+        bash -c "cat >> /tmp/follow-up-queue"
+      echo "Follow-up queued (Claude is running; will be delivered after current response)."
+      ;;
+
+    done|stopped)
+      # Restart Claude with --resume using the follow-up as the new prompt.
+      # Write the prompt to the launch control file, then start a fresh tmux session.
+      if ! kubectl exec -n claude-workers "$task" -- \
+          test -f /tmp/claude-session-id 2>/dev/null; then
+        die "no session ID found in pod — cannot resume a '${status}' pod without one"
+      fi
+
+      printf '%s' "$prompt" | kubectl exec -i -n claude-workers "$task" -- \
+        bash -c "cat > /tmp/claude-current-prompt.txt"
+
+      # Kill any lingering tmux session, then launch a new one
+      kubectl exec -n claude-workers "$task" -- \
+        bash -c "tmux kill-session -t claude 2>/dev/null || true; \
+                 tmux new-session -d -s claude /tmp/claude-launch.sh"
+
+      # Label the pod as running so observers know work is happening
+      kubectl label pod -n claude-workers "$task" status=running --overwrite >/dev/null
+
+      local session_id
+      session_id="$(kubectl exec -n claude-workers "$task" -- \
+        cat /tmp/claude-session-id 2>/dev/null)"
+      echo "Claude resumed (session ${session_id}) with follow-up."
+      ;;
+
+    error|rate-limited|queued)
+      die "cannot send follow-up: task is '${status}'. Follow-up requires status running, waiting-input, done, or stopped."
+      ;;
+
+    *)
+      die "cannot send follow-up: unknown status '${status}'"
+      ;;
+  esac
+
+  # Append a FOLLOW_UP event to the pod's event log
+  local preview="${prompt:0:80}"
+  printf '%s FOLLOW_UP prompt="%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$preview" | \
+    kubectl exec -i -n claude-workers "$task" -- \
+      bash -c "cat >> /workspace/.claude-events.log" 2>/dev/null || true
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
   usage
@@ -732,6 +839,7 @@ case "$subcommand" in
   dismiss)     cmd_dismiss "$@" ;;
   dismiss-all) cmd_dismiss_all "$@" ;;
   queue)       cmd_queue "$@" ;;
+  follow-up)   cmd_follow_up "$@" ;;
   *)
     die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
 esac
