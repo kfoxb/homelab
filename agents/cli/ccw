@@ -29,6 +29,7 @@ Subcommands:
   follow-up   Send a follow-up message to a Claude session
   history     Show event history for a task (or all tasks)
   feedback    Show branch info and send feedback to a task
+  dashboard   Live-updating terminal overview of all worker activity
 
 Run 'ccw <subcommand> --help' for subcommand-specific options.
 EOF
@@ -1523,6 +1524,232 @@ TEMPLATE
   echo "Claude is working on your feedback. Connect with: ccw ssh ${task}"
 }
 
+# ─── ccw dashboard ────────────────────────────────────────────────────────────
+cmd_dashboard() {
+  local once=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --once)   once=true; shift ;;
+      --help|-h)
+        echo "Usage: ccw dashboard [--once]"
+        echo ""
+        echo "Live-updating terminal overview of all worker activity."
+        echo ""
+        echo "Options:"
+        echo "  --once    Print once and exit (useful for scripting)"
+        return 0
+        ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  require_cmd kubectl
+  require_cmd jq
+
+  # ── Color/formatting setup (only when stdout is a TTY)
+  local is_tty=false
+  local c_reset="" c_green="" c_yellow="" c_blue="" c_red="" c_dim="" c_bold=""
+  if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+    is_tty=true
+    c_reset="$(tput sgr0)"
+    c_green="$(tput setaf 2)"
+    c_yellow="$(tput setaf 3)"
+    c_blue="$(tput setaf 4)"
+    c_red="$(tput setaf 1)"
+    c_dim="$(tput dim 2>/dev/null || true)"
+    c_bold="$(tput bold 2>/dev/null || true)"
+  fi
+
+  # Restore terminal on Ctrl+C
+  cleanup_dashboard() {
+    if $is_tty; then
+      tput cnorm 2>/dev/null || true  # show cursor
+    fi
+    exit 0
+  }
+  trap cleanup_dashboard INT TERM
+
+  # Hide cursor during live display (TTY only)
+  if $is_tty && ! $once; then
+    tput civis 2>/dev/null || true
+  fi
+
+  _render_dashboard() {
+    local now
+    now="$(date +%s)"
+
+    # ── Fetch all worker pods
+    local pods_json
+    pods_json="$(kubectl get pods -n claude-workers -l app=claude-worker -o json 2>/dev/null)" || {
+      echo "error: failed to query pods (is kubectl configured?)"
+      return 1
+    }
+
+    # ── Fetch concurrency limit
+    local max_concurrent
+    max_concurrent="$(kubectl get configmap worker-config -n claude-workers \
+      -o jsonpath='{.data.maxConcurrent}' 2>/dev/null)" || max_concurrent="?"
+
+    # ── Count by status
+    local running_count queued_count rate_limited_count waiting_count done_count error_count
+    running_count="$(echo "$pods_json"      | jq '[.items[] | select(.metadata.labels.status == "running")] | length')"
+    queued_count="$(echo "$pods_json"       | jq '[.items[] | select(.metadata.labels.status == "queued")] | length')"
+    rate_limited_count="$(echo "$pods_json" | jq '[.items[] | select(.metadata.labels.status == "rate-limited")] | length')"
+    waiting_count="$(echo "$pods_json"      | jq '[.items[] | select(.metadata.labels.status == "waiting-input")] | length')"
+    done_count="$(echo "$pods_json"         | jq '[.items[] | select(.metadata.labels.status == "done")] | length')"
+    error_count="$(echo "$pods_json"        | jq '[.items[] | select(.metadata.labels.status == "error")] | length')"
+
+    # ── Header
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    printf "%s  CCW Dashboard%s  %s\n" "${c_bold}" "${c_reset}" "$timestamp"
+    printf "Queue: %s%s/%s running%s  %s%s queued%s  %s%s rate-limited%s\n" \
+      "${c_green}" "$running_count" "$max_concurrent" "${c_reset}" \
+      "${c_blue}" "$queued_count" "${c_reset}" \
+      "${c_yellow}" "$rate_limited_count" "${c_reset}"
+    echo ""
+
+    # ─ Helper: print a row for one pod
+    _pod_row() {
+      local pod="$1"
+      local name repo branch node created_at elapsed status_label color
+
+      name="$(echo "$pod"        | jq -r '.metadata.name')"
+      repo="$(echo "$pod"        | jq -r '.metadata.labels.repo // "-"')"
+      branch="$(echo "$pod"      | jq -r '.metadata.labels.branch // "-"')"
+      node="$(echo "$pod"        | jq -r '.spec.nodeName // "-"')"
+      created_at="$(echo "$pod"  | jq -r '.metadata.creationTimestamp')"
+      elapsed="$(format_age "$created_at")"
+
+      # Shorten node name (strip common suffix)
+      node="${node##*/}"
+
+      printf "  %-35s %-22s %-10s %s\n" \
+        "${name:0:35}" "${branch:0:22}" "${node:0:10}" "$elapsed"
+    }
+
+    # ── RUNNING section
+    local running_pods
+    running_pods="$(echo "$pods_json" | jq -c '[.items[] | select(.metadata.labels.status == "running")] | sort_by(.metadata.creationTimestamp) | .[]')"
+    if [[ -n "$running_pods" ]]; then
+      printf "%sRUNNING%s\n" "${c_green}${c_bold}" "${c_reset}"
+      while IFS= read -r pod; do
+        _pod_row "$pod"
+      done <<< "$running_pods"
+      echo ""
+    fi
+
+    # ── WAITING-INPUT section
+    local waiting_pods
+    waiting_pods="$(echo "$pods_json" | jq -c '[.items[] | select(.metadata.labels.status == "waiting-input")] | sort_by(.metadata.creationTimestamp) | .[]')"
+    if [[ -n "$waiting_pods" ]]; then
+      printf "%sWAITING-INPUT%s\n" "${c_yellow}${c_bold}" "${c_reset}"
+      while IFS= read -r pod; do
+        _pod_row "$pod"
+      done <<< "$waiting_pods"
+      echo ""
+    fi
+
+    # ── QUEUED section
+    local queued_pods
+    queued_pods="$(echo "$pods_json" | jq -c '[.items[] | select(.metadata.labels.status == "queued")] | sort_by(.metadata.creationTimestamp) | .[]')"
+    if [[ -n "$queued_pods" ]]; then
+      printf "%sQUEUED%s\n" "${c_blue}${c_bold}" "${c_reset}"
+      while IFS= read -r pod; do
+        _pod_row "$pod"
+      done <<< "$queued_pods"
+      echo ""
+    fi
+
+    # ── RATE-LIMITED section (with retry countdown)
+    local rate_limited_pods
+    rate_limited_pods="$(echo "$pods_json" | jq -c '[.items[] | select(.metadata.labels.status == "rate-limited")] | sort_by(.metadata.creationTimestamp) | .[]')"
+    if [[ -n "$rate_limited_pods" ]]; then
+      printf "%sRATE-LIMITED%s\n" "${c_yellow}${c_bold}" "${c_reset}"
+      while IFS= read -r pod; do
+        local name branch node created_at elapsed retry_after retry_in
+        name="$(echo "$pod"        | jq -r '.metadata.name')"
+        branch="$(echo "$pod"      | jq -r '.metadata.labels.branch // "-"')"
+        node="$(echo "$pod"        | jq -r '.spec.nodeName // "-"')"
+        node="${node##*/}"
+        created_at="$(echo "$pod"  | jq -r '.metadata.creationTimestamp')"
+        elapsed="$(format_age "$created_at")"
+        retry_after="$(echo "$pod" | jq -r '.metadata.annotations["ccw/retry-after"] // empty')"
+
+        if [[ -n "$retry_after" && "$retry_after" != "null" ]]; then
+          local secs_until=$(( retry_after - now ))
+          if (( secs_until > 0 )); then
+            retry_in="retry in $(format_duration "$secs_until")"
+          else
+            retry_in="retry imminent"
+          fi
+        else
+          retry_in=""
+        fi
+
+        printf "  %-35s %-22s %-10s %-6s %s\n" \
+          "${name:0:35}" "${branch:0:22}" "${node:0:10}" "$elapsed" "$retry_in"
+      done <<< "$rate_limited_pods"
+      echo ""
+    fi
+
+    # ── RECENT section: last 5 done/error pods sorted by creationTimestamp desc
+    local recent_pods
+    recent_pods="$(echo "$pods_json" | jq -c '
+      [.items[] | select(.metadata.labels.status == "done" or .metadata.labels.status == "error")]
+      | sort_by(.metadata.creationTimestamp)
+      | reverse
+      | .[0:5]
+      | .[]
+    ')"
+    if [[ -n "$recent_pods" ]]; then
+      printf "%sRECENT%s\n" "${c_dim}${c_bold}" "${c_reset}"
+      while IFS= read -r pod; do
+        local name branch node created_at elapsed status
+        name="$(echo "$pod"       | jq -r '.metadata.name')"
+        branch="$(echo "$pod"     | jq -r '.metadata.labels.branch // "-"')"
+        node="$(echo "$pod"       | jq -r '.spec.nodeName // "-"')"
+        node="${node##*/}"
+        status="$(echo "$pod"     | jq -r '.metadata.labels.status // "unknown"')"
+        created_at="$(echo "$pod" | jq -r '.metadata.creationTimestamp')"
+        elapsed="$(format_age "$created_at")"
+
+        local status_colored
+        if [[ "$status" == "error" ]]; then
+          status_colored="${c_red}${status}${c_reset}"
+        else
+          status_colored="${c_dim}${status}${c_reset}"
+        fi
+
+        # Pad for color codes
+        local pad=$(( 8 + ${#status_colored} - ${#status} ))
+        printf "  %-35s %-22s %-10s %-${pad}s %s ago\n" \
+          "${name:0:35}" "${branch:0:22}" "${node:0:10}" "$status_colored" "$elapsed"
+      done <<< "$recent_pods"
+      echo ""
+    fi
+
+    # ── Footer (only when looping)
+    if ! $once; then
+      printf "%sPress Ctrl+C to exit. 'ccw ssh <task>' to connect.%s\n" "${c_dim}" "${c_reset}"
+    fi
+  }
+
+  if $once; then
+    _render_dashboard
+    return 0
+  fi
+
+  # ── Live loop: clear and redraw every 5 seconds
+  while true; do
+    if $is_tty; then
+      clear
+    fi
+    _render_dashboard
+    sleep 5
+  done
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
   usage
@@ -1549,6 +1776,7 @@ case "$subcommand" in
   follow-up)   cmd_follow_up "$@" ;;
   history)     cmd_history "$@" ;;
   feedback)    cmd_feedback "$@" ;;
+  dashboard)   cmd_dashboard "$@" ;;
   *)
     die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
 esac
