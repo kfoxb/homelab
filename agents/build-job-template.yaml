@@ -1,0 +1,140 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Name includes repo slug and hash for easy correlation with built images.
+  name: build-${REPO_SLUG}-${PROJECT_HASH}
+  namespace: claude-workers
+  labels:
+    app: image-build
+    repo: ${REPO_SLUG}
+    project-hash: ${PROJECT_HASH}
+spec:
+  # Clean up completed/failed jobs after 1 hour to avoid accumulating stale Jobs.
+  ttlSecondsAfterFinished: 3600
+  # No retries — build failures should be investigated, not silently retried.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: image-build
+        repo: ${REPO_SLUG}
+    spec:
+      restartPolicy: Never
+
+      initContainers:
+        # ── Step 1: Clone the target repository ──────────────────────────────────
+        - name: clone
+          image: alpine/git:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "Cloning ${REPO_URL} at ref ${BUILD_REF} ..."
+              git clone --depth=1 --branch "${BUILD_REF}" "${REPO_URL}" /workspace
+
+              # Fail clearly if the project has no devcontainer Dockerfile.
+              if [ ! -f /workspace/.devcontainer/Dockerfile ]; then
+                echo "ERROR: No .devcontainer/Dockerfile found in ${REPO_URL} at ref ${BUILD_REF}"
+                echo "ERROR: This project cannot be built as a devcontainer image."
+                exit 1
+              fi
+
+              echo "Found .devcontainer/Dockerfile — proceeding with build."
+          env:
+            - name: REPO_URL
+              value: "${REPO_URL}"
+            - name: BUILD_REF
+              value: "${BUILD_REF}"
+            # Optional: inject GitHub token for private repos via the worker secrets.
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: claude-worker-secrets
+                  key: GITHUB_TOKEN
+                  optional: true
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+        # ── Step 2: Build the project devcontainer image ──────────────────────────
+        # Kaniko builds .devcontainer/Dockerfile and pushes to the local registry.
+        # The resulting image is used as the base for the overlay build in step 3.
+        - name: build-project
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - --context=dir:///workspace
+            - --dockerfile=/workspace/.devcontainer/Dockerfile
+            - --destination=registry.claude-workers.svc.cluster.local:5000/${REPO_SLUG}:${PROJECT_HASH}-base
+            - --cache=true
+            - --cache-repo=registry.claude-workers.svc.cluster.local:5000/${REPO_SLUG}/cache
+            # Local registry uses plain HTTP — insecure flag required for push.
+            - --insecure-registry=registry.claude-workers.svc.cluster.local:5000
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+              readOnly: true
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 2Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+
+      # ── Step 3: Build the overlay image ────────────────────────────────────────
+      # Kaniko layers Claude Code tooling onto the project devcontainer image.
+      # The build context is the ConfigMap-mounted /scripts directory, which
+      # contains overlay.Dockerfile plus all support scripts and hooks.
+      containers:
+        - name: build-overlay
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - --context=dir:///scripts
+            - --dockerfile=/scripts/overlay.Dockerfile
+            - --build-arg=BASE_IMAGE=registry.claude-workers.svc.cluster.local:5000/${REPO_SLUG}:${PROJECT_HASH}-base
+            - --destination=registry.claude-workers.svc.cluster.local:5000/${REPO_SLUG}:${FINAL_TAG}
+            - --cache=true
+            - --cache-repo=registry.claude-workers.svc.cluster.local:5000/${REPO_SLUG}/cache
+            # Both push and pull go to/from the local insecure registry.
+            - --insecure-registry=registry.claude-workers.svc.cluster.local:5000
+          volumeMounts:
+            - name: build-scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 2Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+
+      volumes:
+        # Shared workspace for the cloned repo (clone → build-project).
+        - name: workspace
+          emptyDir: {}
+
+        # Overlay build context from the ConfigMap.
+        # items mapping places each file at the correct path for the Dockerfile's
+        # COPY directives: entrypoint.sh, status-monitor.sh, and hooks/on-stop.sh.
+        - name: build-scripts
+          configMap:
+            name: build-scripts
+            defaultMode: 0755
+            items:
+              - key: overlay.Dockerfile
+                path: overlay.Dockerfile
+              - key: entrypoint.sh
+                path: entrypoint.sh
+              - key: status-monitor.sh
+                path: status-monitor.sh
+              # ConfigMap keys can't contain '/' — on-stop.sh maps to hooks/ subdir.
+              - key: on-stop.sh
+                path: hooks/on-stop.sh
