@@ -1,0 +1,108 @@
+[
+  {
+    "id": "4.1",
+    "title": "Implement session ID capture and resume",
+    "description": "Update the entrypoint to capture Claude's session ID from stream-json output and use it when resuming after a rate limit hit.\n\nCapture: pipe Claude's output through a filter that reads the `init` event and saves `session_id` to `/tmp/claude-session-id`.\n\nResume: at the start of each Claude launch, check if `/tmp/claude-session-id` exists. If it does, add `--resume <id>` to the claude invocation and use the prompt \"Continue where you left off.\" instead of the original prompt.\n\nThis integrates with the rate limit recovery in Phase 3 — when the scheduler re-queues a rate-limited pod and the entrypoint loop restarts Claude, it will automatically use the session resume.",
+    "acceptance_criteria": [
+      "`/tmp/claude-session-id` is written within seconds of Claude starting",
+      "If the file exists when entrypoint restarts Claude, `--resume <id>` is used",
+      "Session resume is logged as a RESUMED event (once event logging is implemented in 4.3)",
+      "If session resume fails (invalid/expired session), entrypoint falls back to fresh start with original prompt",
+      "The original prompt is preserved in `/tmp/claude-initial-prompt` so fallback is possible"
+    ],
+    "files": [
+      "agents/base-image/entrypoint.sh (update)"
+    ],
+    "labels": ["infrastructure", "bash", "phase-4"],
+    "estimate": "S"
+  },
+  {
+    "id": "4.2",
+    "title": "Build pod status monitor",
+    "description": "Create `agents/base-image/status-monitor.sh`, a background script that accurately tracks Claude's state and updates the pod label.\n\nThe monitor runs as a background process launched from the entrypoint. Every 10 seconds it checks:\n1. Is the tmux session `claude` alive? (`tmux has-session -t claude`)\n2. Is a `claude` process running? (`pgrep -f 'claude '`)\n3. Does `/tmp/claude-done` exist? (set by entrypoint on exit)\n\nState transitions:\n- tmux alive + claude process running → no change (still `running`)\n- tmux alive + no claude process → `waiting-input` (Claude finished, session waiting)\n- tmux gone + `/tmp/claude-done` → `done` or `error` (based on exit code file)\n- tmux gone + no done file → `error` (unexpected exit)\n\nThe script uses `kubectl label pod $HOSTNAME -n claude-workers <label>=<value> --overwrite` and only patches when the value changes (read current label first).",
+    "acceptance_criteria": [
+      "Status monitor runs as a background process in each pod",
+      "Pod label changes to `waiting-input` when Claude finishes a response in tmux",
+      "Pod label changes to `done` when entrypoint writes /tmp/claude-done with exit code 0",
+      "Pod label changes to `error` when Claude exits unexpectedly",
+      "Monitor does not thrash labels (only patches on actual state changes)",
+      "Monitor exits cleanly when the pod is being terminated"
+    ],
+    "files": [
+      "agents/base-image/status-monitor.sh",
+      "agents/base-image/entrypoint.sh (launch status-monitor in background)",
+      "agents/base-image/Dockerfile (copy status-monitor.sh)"
+    ],
+    "labels": ["infrastructure", "bash", "phase-4"],
+    "estimate": "M"
+  },
+  {
+    "id": "4.3",
+    "title": "Implement pod event logging",
+    "description": "Add structured event logging to the entrypoint script. Each significant lifecycle event is appended to `/workspace/.claude-events.log` in a machine-readable format.\n\nFormat: `<ISO8601 timestamp> <EVENT> [key=value ...]`\n\nEvents to log:\n- `STARTED` — pod began initialization (task, repo, branch, ticket)\n- `CLONED` — git clone completed (elapsed time)\n- `BRANCH_CHECKED_OUT` — branch ready (branch name, created=true/false)\n- `CLAUDE_STARTED` — Claude launched (session_id)\n- `RATE_LIMITED` — rate limit detected (retry_after ISO8601)\n- `RESUMED` — Claude resumed after rate limit (session_id)\n- `CLAUDE_DONE` — Claude exited (exit_code, elapsed)\n- `FOLLOW_UP` — follow-up prompt received (prompt preview, first 80 chars)\n- `ERROR` — unexpected error (message)\n\nHelper function in entrypoint:\n```bash\nlog_event() {\n  echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) $@\" >> /workspace/.claude-events.log\n}\n```",
+    "acceptance_criteria": [
+      "`/workspace/.claude-events.log` is created when pod starts",
+      "All listed events are written with correct format",
+      "Event log is readable via `kubectl exec -- cat /workspace/.claude-events.log`",
+      "Events include relevant key=value metadata for each event type",
+      "Log file survives across multiple Claude sessions in the same pod"
+    ],
+    "files": [
+      "agents/base-image/entrypoint.sh (add log_event calls)"
+    ],
+    "labels": ["infrastructure", "bash", "phase-4"],
+    "estimate": "S"
+  },
+  {
+    "id": "4.4",
+    "title": "Implement `ccw follow-up <task>`",
+    "description": "Add `ccw follow-up <task> [--prompt] <text>` subcommand to send additional instructions to Claude.\n\nBehavior based on pod status:\n- `waiting-input` (Claude at interactive prompt): send text directly to tmux:\n  ```bash\n  kubectl exec -n claude-workers <pod> -- \\\n    tmux send-keys -t claude \"<escaped-prompt>\" Enter\n  ```\n- `running` (Claude actively working): write to follow-up queue file in pod:\n  ```bash\n  kubectl exec -n claude-workers <pod> -- \\\n    bash -c \"echo '<prompt>' >> /tmp/follow-up-queue\"\n  ```\n  The entrypoint picks up queued follow-ups after Claude finishes.\n- `done` or `stopped`: resume Claude with the follow-up as a new session start:\n  ```bash\n  # Send to tmux which will start a new claude run\n  kubectl exec -n claude-workers <pod> -- \\\n    tmux send-keys -t claude \"claude --resume $(cat /tmp/claude-session-id) '<prompt>'\" Enter\n  ```\n- `error` / `rate-limited` / `queued`: print error with explanation\n\nAlso append a FOLLOW_UP event to the event log.",
+    "acceptance_criteria": [
+      "`ccw follow-up <task> \"add unit tests\"` sends prompt to waiting-input Claude",
+      "Follow-up while running queues the message for after current response",
+      "Follow-up on a done pod resumes Claude with session ID",
+      "Error message explains why follow-up isn't possible for rate-limited/queued pods",
+      "FOLLOW_UP event is written to the event log"
+    ],
+    "files": [
+      "agents/cli/ccw (follow-up subcommand)",
+      "agents/base-image/entrypoint.sh (follow-up queue processing)"
+    ],
+    "labels": ["cli", "bash", "phase-4"],
+    "estimate": "M"
+  },
+  {
+    "id": "4.5",
+    "title": "Implement `ccw history`",
+    "description": "Add two variants of event history:\n\n`ccw history <task>` — show all events for a specific task:\n```\n2024-03-15 10:00:00  STARTED        task=my-app-20240315-a3f9\n2024-03-15 10:00:05  CLONED         elapsed=5s\n2024-03-15 10:00:06  BRANCH_READY   branch=feat/login created=false\n2024-03-15 10:00:07  CLAUDE_STARTED session=abc123\n2024-03-15 14:32:10  RATE_LIMITED   retry=2024-03-15T19:32:10Z\n2024-03-15 19:32:15  RESUMED        session=abc123\n2024-03-15 20:45:00  CLAUDE_DONE    exit=0 elapsed=1h12m\n```\n\nFetch via `kubectl exec -n claude-workers <pod> -- cat /workspace/.claude-events.log`.\n\n`ccw history` (no args) — aggregate recent events across all pods, last 50 events sorted by time:\n```\n[my-app-20240315-a3f9]  10:00:00  STARTED\n[other-20240314-b8c2]   10:02:00  CLAUDE_DONE exit=0\n...\n```",
+    "acceptance_criteria": [
+      "`ccw history <task>` prints all events from that pod's event log",
+      "`ccw history` aggregates recent events across all running/recent pods",
+      "Timestamps are formatted readably (not raw Unix timestamps)",
+      "Error if task doesn't exist or event log is not found (pod too new)",
+      "Events are color-coded by type (STARTED=blue, DONE=green, ERROR=red, RATE_LIMITED=yellow)"
+    ],
+    "files": [
+      "agents/cli/ccw (history subcommand)"
+    ],
+    "labels": ["cli", "bash", "phase-4"],
+    "estimate": "S"
+  },
+  {
+    "id": "4.6",
+    "title": "Implement `ccw feedback <task>`",
+    "description": "Add `ccw feedback <task> <message>` as a high-level workflow command for the human review loop.\n\nThis command is designed for the flow where:\n1. Claude pushed some commits\n2. Human pulled the branch and tested it locally\n3. Human has specific feedback to send back\n\nThe command:\n1. Fetches and displays task metadata:\n   ```\n   Task:     my-app-20240315-a3f9\n   Branch:   feat/login\n   Latest:   abc1234 - \"Add login form validation\" (2 commits pushed)\n   Status:   done\n   ```\n   (Branch/commit info from `kubectl exec -- git -C /workspace/<repo> log --oneline -3`)\n2. Sends the message as a follow-up (delegates to `ccw follow-up` internally)\n3. Prints connection instructions: \"Claude is working on your feedback. Connect with: ccw ssh <task>\"\n\nAlso support `ccw feedback <task>` (no message) to open an editor for longer feedback.",
+    "acceptance_criteria": [
+      "`ccw feedback <task> \"fix the tests\"` shows branch info then sends feedback",
+      "Latest commit info is shown (fetched from git inside the pod)",
+      "Feedback is sent as a follow-up prompt to Claude",
+      "`ccw feedback <task>` (no message) opens $EDITOR for multi-line feedback",
+      "Output confirms that Claude is working and how to connect"
+    ],
+    "files": [
+      "agents/cli/ccw (feedback subcommand)"
+    ],
+    "labels": ["cli", "bash", "phase-4"],
+    "estimate": "S"
+  }
+]

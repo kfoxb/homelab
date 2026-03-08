@@ -1,0 +1,115 @@
+[
+  {
+    "id": "6.1",
+    "title": "Implement Linear ticket context fetching in `ccw start`",
+    "description": "When `ccw start --ticket LIN-123` is provided, fetch the ticket's details from Linear and inject them into Claude's initial prompt.\n\nRequires `LINEAR_API_KEY` environment variable (add to the `claude-worker-secrets` Secret and document in `secrets.yaml.example`).\n\nGraphQL query to fetch: title, description, current state, assignee, and recent comments (last 5).\n\nThe context is formatted as a Markdown block and prepended to Claude's prompt before writing it to the pod. Keep total context under ~2000 chars to avoid overshadowing the actual task prompt.\n\nAlso: the `LINEAR_TICKET` pod label should store the full ticket ID (e.g., `LIN-123`) for display in `ccw list`.",
+    "acceptance_criteria": [
+      "`ccw start --ticket LIN-123 --prompt \"fix this\"` fetches ticket from Linear",
+      "Claude's initial prompt contains the ticket title, description, and recent comments",
+      "`ccw list` shows the ticket ID in the TICKET column",
+      "If `LINEAR_API_KEY` is not set, `--ticket` flag prints a clear error",
+      "If ticket ID is invalid/not found, `ccw start` fails with a helpful error before creating the pod",
+      "Long ticket descriptions are truncated gracefully (with a \"... (truncated)\" note)"
+    ],
+    "files": [
+      "agents/cli/ccw (update start subcommand)",
+      "agents/secrets.yaml.example (add LINEAR_API_KEY)"
+    ],
+    "labels": ["cli", "linear", "phase-6"],
+    "estimate": "S"
+  },
+  {
+    "id": "6.2",
+    "title": "Implement Linear completion hook",
+    "description": "Create `agents/base-image/hooks/on-complete.sh` — a script that runs when Claude finishes a task and posts a summary comment to the associated Linear ticket.\n\nThe hook is triggered by the entrypoint when Claude exits with status=done and a Linear ticket ID is configured (set in env var `LINEAR_TICKET` in the pod).\n\nProcess:\n1. Check `LINEAR_TICKET` env var — if `none` or empty, skip\n2. Ask Claude for a summary (1 new claude invocation, --max-turns 1):\n   ```\n   claude -p \"Summarize in 2-3 sentences what you just accomplished. Be specific about what files were changed, what was added/fixed, and the branch name where the changes are.\" --max-turns 1\n   ```\n3. Format as a Markdown comment with branch name and link\n4. POST to Linear GraphQL API using `curl`\n5. Log result to event log (LINEAR_COMMENT_POSTED or LINEAR_COMMENT_FAILED)\n\nThe hook script is copied into the image at `/usr/local/bin/on-complete.sh` and called from the entrypoint after status transitions to done.",
+    "acceptance_criteria": [
+      "Completing a task with --ticket LIN-123 posts a comment to that Linear issue",
+      "Comment includes a summary of what was accomplished and the branch name",
+      "If LINEAR_API_KEY is missing, hook exits gracefully without error",
+      "If Linear API call fails, it's logged but doesn't affect pod status",
+      "Tasks without a ticket (ticket=none) skip the hook silently"
+    ],
+    "files": [
+      "agents/base-image/hooks/on-complete.sh",
+      "agents/base-image/Dockerfile (copy hook, call from entrypoint)",
+      "agents/base-image/entrypoint.sh (call on-complete.sh after done)"
+    ],
+    "labels": ["infrastructure", "linear", "phase-6"],
+    "estimate": "S"
+  },
+  {
+    "id": "6.3",
+    "title": "Implement `ccw dashboard`",
+    "description": "Add `ccw dashboard` — a live-updating terminal overview of all Claude worker activity.\n\nDisplays:\n- Header with current time and queue summary (X/Y running, Z queued)\n- RUNNING section: each running pod with repo slug, branch, node, elapsed time\n- WAITING-INPUT section: pods where Claude finished and is idle\n- QUEUED section: pods waiting for a concurrency slot\n- RATE-LIMITED section: pods in cooldown with retry countdown\n- RECENT section: last 5 completed/error pods\n\nRefresh: redraw every 5 seconds using `while true; do clear; render; sleep 5; done`. Trap SIGINT to restore terminal.\n\nUse `tput` for color (green=running, yellow=waiting-input, blue=queued, red=error). Fall back to plain text if not a TTY.\n\nOptional: `ccw dashboard --once` prints once without looping (for scripts).",
+    "acceptance_criteria": [
+      "`ccw dashboard` shows all worker pods grouped by status",
+      "Display updates every 5 seconds",
+      "Ctrl+C exits cleanly without leaving terminal in bad state",
+      "Queue summary line shows running/queued/rate-limited counts",
+      "Elapsed time for running pods updates each refresh",
+      "`ccw dashboard --once` prints once and exits (useful for scripting)"
+    ],
+    "files": [
+      "agents/cli/ccw (dashboard subcommand)"
+    ],
+    "labels": ["cli", "bash", "phase-6"],
+    "estimate": "M"
+  },
+  {
+    "id": "6.4",
+    "title": "Distribute `ccw` via kfoxb/dotfiles",
+    "description": "Add `ccw` to the kfoxb/dotfiles repository so it's automatically available everywhere dotfiles are installed (local devcontainers, beelink nodes via SSH, claude-worker pods themselves).\n\nSteps:\n1. Copy `ccw` to `bin/ccw` in the dotfiles repo\n2. The dotfiles install script should add `$DOTFILES_DIR/bin` to PATH (if not already)\n3. Add `CCW_HOMELAB_DIR` to the dotfiles shell config (default: `~/homelab`)\n4. Test that `ccw --help` works after a fresh dotfiles install\n\nNote: `ccw` needs to know where `pod-template.yaml` is. The script uses `$CCW_HOMELAB_DIR` (defaulting to `~/homelab`) to find it. This means the homelab repo should be cloned locally, but `ccw` still works standalone for read-only commands (list, status, ssh, logs, stop, dismiss) without the homelab repo.\n\nAlso create `agents/cli/install.sh` as an alternative standalone installer:\n```bash\ncurl -sL https://raw.githubusercontent.com/<org>/homelab/main/agents/cli/ccw \\\n  -o ~/.local/bin/ccw && chmod +x ~/.local/bin/ccw\n```",
+    "acceptance_criteria": [
+      "`ccw` is available in PATH after a fresh dotfiles install",
+      "`ccw list` works without the homelab repo cloned (read-only commands)",
+      "`ccw start` works when CCW_HOMELAB_DIR points to a cloned homelab repo",
+      "`agents/cli/install.sh` one-liner installer works",
+      "The dotfiles PR is documented in this ticket with a link"
+    ],
+    "files": [
+      "agents/cli/install.sh",
+      "agents/cli/ccw (add CCW_HOMELAB_DIR support)",
+      "(PR to kfoxb/dotfiles — external repo)"
+    ],
+    "labels": ["cli", "dotfiles", "phase-6"],
+    "estimate": "S"
+  },
+  {
+    "id": "6.5",
+    "title": "Add auto-cleanup CronJob for stale pods",
+    "description": "Create a CronJob that runs nightly and deletes pods in terminal states (done, error, stopped) that are older than a configurable TTL.\n\nThe CronJob:\n- Runs at 3am daily\n- Uses `bitnami/kubectl` image (lightweight, has kubectl)\n- For each pod with status in [done, error, stopped]: compute age from creationTimestamp, delete if older than TTL\n- TTL configured via `worker-config.yaml` ConfigMap key `podTTLHours` (default: 48)\n- Dry-run mode: `--dry-run` flag (or env var `CLEANUP_DRY_RUN=true`) logs what would be deleted without deleting\n\nCleanup script logic:\n```bash\nTTL_HOURS=$(kubectl get configmap worker-config ... podTTLHours)\nfor POD in $(kubectl get pods -n claude-workers -l app=claude-worker ...):\n  STATUS=$(... label status)\n  if [[ \"$STATUS\" =~ ^(done|error|stopped)$ ]]; then\n    AGE_HOURS=$(compute age from creationTimestamp)\n    if [ $AGE_HOURS -gt $TTL_HOURS ]; then\n      echo \"Deleting $POD (age: ${AGE_HOURS}h, status: $STATUS)\"\n      kubectl delete pod $POD -n claude-workers\n    fi\n  fi\ndone\n```\n\nAdd `podTTLHours: \"48\"` to `agents/worker-config.yaml`.",
+    "acceptance_criteria": [
+      "CronJob runs at 3am and deletes stale terminal-state pods",
+      "Pods newer than TTL are not deleted",
+      "Running/queued/rate-limited pods are never deleted by cleanup",
+      "`CLEANUP_DRY_RUN=true` logs what would be deleted without deleting",
+      "Cleanup events are visible in CronJob logs",
+      "worker-config.yaml has podTTLHours key"
+    ],
+    "files": [
+      "agents/cleanup-cronjob.yaml",
+      "agents/worker-config.yaml (add podTTLHours)"
+    ],
+    "labels": ["infrastructure", "kubernetes", "phase-6"],
+    "estimate": "S"
+  },
+  {
+    "id": "6.6",
+    "title": "Write comprehensive documentation",
+    "description": "Rewrite `agents/README.md` with full documentation covering architecture, setup, CLI reference, and troubleshooting.\n\nSections:\n1. **Overview** — what this system does and why\n2. **Architecture** — diagram/description of components (pods, scheduler, registry, CLI)\n3. **Prerequisites** — what must be set up first (Longhorn, K3s, secrets)\n4. **Setup guide** — step-by-step: apply manifests, build image, configure nodes, install CLI\n5. **CLI Reference** — every `ccw` subcommand with arguments and examples\n6. **Workflow guide** — typical usage patterns (start task → monitor → feedback → dismiss)\n7. **Configuration** — worker-config.yaml settings reference\n8. **Troubleshooting** — common issues:\n   - Pod stuck in queued\n   - Claude not starting\n   - Rate limit handling\n   - Registry issues\n   - Image build failures\n9. **Resource planning** — how many concurrent tasks the cluster can handle\n\nAlso update the top-level `README.md` of the homelab repo to mention the agents system.",
+    "acceptance_criteria": [
+      "`agents/README.md` covers all listed sections",
+      "A new user can follow the setup guide from scratch and get a working agent",
+      "All ccw subcommands are documented with examples",
+      "Troubleshooting section covers at least 5 common issues",
+      "Top-level homelab README.md references the agents system",
+      "No broken links or references to files that don't exist"
+    ],
+    "files": [
+      "agents/README.md (full rewrite)",
+      "README.md (update to mention agents)"
+    ],
+    "labels": ["documentation", "phase-6"],
+    "estimate": "M"
+  }
+]

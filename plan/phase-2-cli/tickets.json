@@ -1,0 +1,120 @@
+[
+  {
+    "id": "2.1",
+    "title": "Scaffold ccw bash CLI with help and argument parsing",
+    "description": "Create the `agents/cli/ccw` bash script skeleton with:\n- `#!/usr/bin/env bash` + `set -euo pipefail`\n- Top-level subcommand dispatch (`case \"$1\" in start|list|status|ssh|shell|logs|stop|dismiss|dismiss-all|help)`\n- `ccw help` / `ccw --help` showing all subcommands with brief descriptions\n- Common helper functions:\n  - `CCW_NAMESPACE=claude-workers`\n  - `pod_name <task>` — validates task exists as a pod\n  - `require_task <task>` — exits with error if pod not found\n  - `get_pod_label <pod> <label>` — extracts a label value via jsonpath\n  - `find_pod_template` — locates pod-template.yaml relative to script or via `$CCW_POD_TEMPLATE`\n- `agents/cli/install.sh` that copies `ccw` to `~/.local/bin/ccw` and makes it executable",
+    "acceptance_criteria": [
+      "`ccw help` prints usage without errors",
+      "`ccw` with no args prints help",
+      "`ccw unknown-command` prints error and help",
+      "`bash agents/cli/install.sh` installs ccw to ~/.local/bin/ccw",
+      "Script has no shellcheck warnings"
+    ],
+    "files": [
+      "agents/cli/ccw",
+      "agents/cli/install.sh"
+    ],
+    "labels": ["cli", "bash", "phase-2"],
+    "estimate": "S"
+  },
+  {
+    "id": "2.2",
+    "title": "Implement `ccw start`",
+    "description": "Implement the `ccw start` subcommand.\n\nArguments:\n- `--repo <url>` (required) — git repository URL\n- `--branch <name>` (required) — branch to work on (created if not exists)\n- `--prompt <text>` (required) — initial prompt for Claude\n- `--ticket <id>` (optional, default: none) — Linear ticket ID\n- `--image <image>` (optional) — override container image\n\nBehavior:\n1. Validate required args\n2. Generate task name: `<repo-slug>-<yyyymmdd>-<4-char-random>` (max 63 chars)\n3. Extract repo slug from URL for labels (URL-encode slashes as hyphens)\n4. Write the prompt to a temp file (to handle special chars safely)\n5. Export env vars: TASK_NAME, REPO_URL, REPO_SLUG, GIT_BRANCH, LINEAR_TICKET, CLAUDE_IMAGE\n6. Run `envsubst < <pod-template> | kubectl apply -f -`\n7. Print task name and connection instructions:\n   ```\n   Task started: my-app-20240315-a3f9\n   To connect:   ccw ssh my-app-20240315-a3f9\n   To monitor:   ccw logs my-app-20240315-a3f9 --follow\n   ```",
+    "acceptance_criteria": [
+      "`ccw start --repo <url> --branch main --prompt 'list files'` creates a pod in claude-workers",
+      "Pod has correct labels: app, task, repo, branch, ticket, status=running",
+      "Task name is printed after creation",
+      "Error if --repo, --branch, or --prompt are missing",
+      "Long repo names are truncated so pod name stays under 63 chars"
+    ],
+    "files": [
+      "agents/cli/ccw (start subcommand)"
+    ],
+    "labels": ["cli", "bash", "phase-2"],
+    "estimate": "S"
+  },
+  {
+    "id": "2.3",
+    "title": "Implement `ccw list`",
+    "description": "Implement `ccw list` to show all worker pods in a human-readable table.\n\nUse `kubectl get pods -n claude-workers -l app=claude-worker` with `-o custom-columns` or pipe through `jq` for formatting.\n\nOutput columns:\n- TASK (pod name)\n- STATUS (from label `status`, not pod phase)\n- REPO (from label `repo`)\n- BRANCH (from label `branch`)\n- TICKET (from label `ticket`, omit if none)\n- AGE (from pod creation timestamp, formatted as Xm/Xh/Xd)\n- NODE\n\nColor-code STATUS:\n- `running` → green\n- `done` → dim/grey\n- `error` → red\n- `rate-limited` → yellow\n- `queued` → blue\n\n(Use tput colors if terminal supports it, plain text otherwise.)",
+    "acceptance_criteria": [
+      "`ccw list` shows all claude-worker pods in a table",
+      "STATUS column shows the pod label value (not Kubernetes pod phase)",
+      "Output is readable in a standard terminal column width",
+      "Works when there are zero pods (prints header + empty state message)",
+      "Color codes are skipped when output is piped (not a TTY)"
+    ],
+    "files": [
+      "agents/cli/ccw (list subcommand)"
+    ],
+    "labels": ["cli", "bash", "phase-2"],
+    "estimate": "S"
+  },
+  {
+    "id": "2.4",
+    "title": "Implement `ccw status <task>`",
+    "description": "Implement `ccw status <task>` to show detailed information about a single task.\n\nOutput:\n```\nTask:     my-app-20240315-a3f9\nStatus:   running\nRepo:     https://github.com/user/my-app\nBranch:   feat/login\nTicket:   LIN-234\nNode:     beelink2\nAge:      14m\nPod IP:   10.42.1.15\n\n--- Recent output (last 30 lines) ---\n<tail of /workspace/.claude-output.log via kubectl exec>\n```\n\nFetch pod metadata via `kubectl get pod -n claude-workers <task> -o json` + jq.\nFetch recent output via `kubectl exec -n claude-workers <task> -- tail -n 30 /workspace/.claude-output.log`.",
+    "acceptance_criteria": [
+      "`ccw status <task>` shows all metadata fields",
+      "Recent output section shows last 30 lines of Claude's output log",
+      "Error message if task doesn't exist",
+      "Output section is skipped gracefully if log file doesn't exist yet"
+    ],
+    "files": [
+      "agents/cli/ccw (status subcommand)"
+    ],
+    "labels": ["cli", "bash", "phase-2"],
+    "estimate": "XS"
+  },
+  {
+    "id": "2.5",
+    "title": "Implement `ccw ssh` and `ccw shell`",
+    "description": "Implement two connection subcommands:\n\n`ccw ssh <task>` — attaches to the Claude tmux session:\n```bash\nkubectl exec -it -n claude-workers <pod> -- tmux attach -t claude\n```\nIf Claude is done and tmux session no longer exists, print a message and offer to open a shell instead.\n\n`ccw shell <task>` — opens a plain bash shell in the pod:\n```bash\nkubectl exec -it -n claude-workers <pod> -- bash\n```\n\nBoth commands should print a brief reminder before connecting:\n- For ssh: \"Attaching to Claude's tmux session. Detach with Ctrl+B D.\"\n- For shell: \"Opening bash shell. Claude is running in tmux session 'claude'.\"",
+    "acceptance_criteria": [
+      "`ccw ssh <task>` attaches to the tmux session named `claude`",
+      "`ccw shell <task>` opens a bash shell",
+      "Helpful message is printed before connecting",
+      "Graceful error if pod doesn't exist",
+      "`ccw ssh` prints helpful message if tmux session doesn't exist (Claude already finished)"
+    ],
+    "files": [
+      "agents/cli/ccw (ssh, shell subcommands)"
+    ],
+    "labels": ["cli", "bash", "phase-2"],
+    "estimate": "XS"
+  },
+  {
+    "id": "2.6",
+    "title": "Implement `ccw logs <task>`",
+    "description": "Implement `ccw logs <task> [--follow]` to read Claude's output log from the pod.\n\nThe log is at `/workspace/.claude-output.log` inside the pod.\n\nWithout `--follow`: print last 100 lines via `kubectl exec -- tail -n 100`.\nWith `--follow`: stream the log live via `kubectl exec -- tail -f`.\n\nAlso support `ccw logs <task> --since <N>` to show last N lines.\n\nNote: this is different from `kubectl logs <pod>` which shows container stdout. This reads the Claude-specific output log that the entrypoint tees.",
+    "acceptance_criteria": [
+      "`ccw logs <task>` prints last 100 lines of Claude's output",
+      "`ccw logs <task> --follow` streams new output as it arrives",
+      "`ccw logs <task> --since 50` shows last 50 lines",
+      "Graceful error if pod or log file doesn't exist"
+    ],
+    "files": [
+      "agents/cli/ccw (logs subcommand)"
+    ],
+    "labels": ["cli", "bash", "phase-2"],
+    "estimate": "XS"
+  },
+  {
+    "id": "2.7",
+    "title": "Implement `ccw stop` and `ccw dismiss`",
+    "description": "Implement two lifecycle subcommands:\n\n`ccw stop <task>` — gracefully stops Claude but keeps the pod alive:\n```bash\n# Send SIGTERM to Claude process inside pod\nkubectl exec -n claude-workers <pod> -- pkill -SIGTERM -f 'claude'\n# Update status label\nkubectl label pod -n claude-workers <pod> status=stopped --overwrite\n```\nPrint: \"Claude stopped. Pod is still running. Use `ccw dismiss <task>` to remove it.\"\n\n`ccw dismiss <task>` — deletes the pod entirely:\n```bash\nkubectl delete pod -n claude-workers <pod>\n```\nConfirm before deleting if pod status is `running` (prompt: \"Task is still running. Dismiss anyway? [y/N]\")\n\n`ccw dismiss-all` — dismiss all pods with `status=done` or `status=error`. Require explicit `--include-running` flag to dismiss running pods.\n\n`ccw stop-all` — stop Claude in all `status=running` pods.",
+    "acceptance_criteria": [
+      "`ccw stop <task>` sends SIGTERM to Claude, updates label to stopped",
+      "`ccw dismiss <task>` deletes the pod",
+      "`ccw dismiss <task>` prompts for confirmation when pod is running",
+      "`ccw dismiss-all` removes done/error pods without confirmation",
+      "`ccw dismiss-all --include-running` also removes running pods with confirmation"
+    ],
+    "files": [
+      "agents/cli/ccw (stop, dismiss, stop-all, dismiss-all subcommands)"
+    ],
+    "labels": ["cli", "bash", "phase-2"],
+    "estimate": "S"
+  }
+]

@@ -1,0 +1,105 @@
+[
+  {
+    "id": "3.1",
+    "title": "Create worker-config ConfigMap",
+    "description": "Create a ConfigMap in the `claude-workers` namespace with configuration settings for the queue scheduler.\n\nInitial settings:\n- `maxConcurrent: \"2\"` — maximum number of simultaneously running Claude sessions\n- `rateLimitCooldownMinutes: \"300\"` — how long to wait before retrying after a rate limit hit (5 hours matches Claude's rolling window)\n\nThe scheduler Deployment will mount this ConfigMap and re-read it on each loop iteration so settings can be changed without restarting the scheduler.",
+    "acceptance_criteria": [
+      "`kubectl apply -f agents/worker-config.yaml` creates the ConfigMap in claude-workers",
+      "ConfigMap has maxConcurrent and rateLimitCooldownMinutes keys",
+      "README documents how to change settings: `kubectl edit configmap worker-config -n claude-workers`"
+    ],
+    "files": [
+      "agents/worker-config.yaml"
+    ],
+    "labels": ["infrastructure", "kubernetes", "phase-3"],
+    "estimate": "XS"
+  },
+  {
+    "id": "3.2",
+    "title": "Implement queue-aware entrypoint wait loop",
+    "description": "Update `agents/base-image/entrypoint.sh` to wait for the scheduler to release the pod before launching Claude.\n\nNew flow at startup:\n1. Configure git credentials (unchanged)\n2. **NEW: Wait loop** — poll every 5 seconds until pod label `status` is `running`:\n   ```bash\n   echo \"Waiting for queue release...\"\n   while true; do\n     STATUS=$(kubectl get pod \"$HOSTNAME\" -n claude-workers \\\n       -o jsonpath='{.metadata.labels.status}' 2>/dev/null)\n     [ \"$STATUS\" = \"running\" ] && break\n     sleep 5\n   done\n   echo \"Released by scheduler, starting work...\"\n   ```\n3. Clone repo, checkout branch, start Claude (unchanged after this point)\n\nNote: For Phase 1 compatibility, if the pod was created with `status=running` (manual launch without the scheduler), the wait loop exits immediately.",
+    "acceptance_criteria": [
+      "Pod created with status=queued waits before cloning repo or starting Claude",
+      "Pod starts Claude immediately after label changes to status=running",
+      "Pod created with status=running (legacy/manual) starts Claude immediately",
+      "\"Waiting for queue release\" message appears in pod logs",
+      "Wait loop does not consume excessive CPU (5 second sleep between checks)"
+    ],
+    "files": [
+      "agents/base-image/entrypoint.sh (update)"
+    ],
+    "labels": ["infrastructure", "bash", "phase-3"],
+    "estimate": "S"
+  },
+  {
+    "id": "3.3",
+    "title": "Build queue scheduler Deployment",
+    "description": "Create a Deployment in `claude-workers` namespace that runs a bash loop every 30 seconds to promote queued pods.\n\nScheduler logic (`agents/scheduler/entrypoint.sh`):\n```\nwhile true; do\n  sleep 30\n  MAX=$(kubectl get configmap worker-config ... maxConcurrent)\n  RUNNING=$(kubectl get pods ... status=running | count)\n  \n  if RUNNING < MAX:\n    OLDEST_QUEUED = oldest pod with status=queued\n    if exists:\n      kubectl label pod OLDEST_QUEUED status=running --overwrite\n      echo \"Released: OLDEST_QUEUED\"\ndone\n```\n\nThe Deployment:\n- 1 replica\n- Small resources: 100m CPU, 128Mi RAM\n- Uses the `claude-worker` ServiceAccount (already has pod patch permissions)\n- Uses a minimal image: `bitnami/kubectl:latest` or similar (needs kubectl + bash)\n- Mounts worker-config ConfigMap\n\nCreate RBAC additions if needed: the ServiceAccount needs `list` and `get` on pods (in addition to `patch` from Phase 1).",
+    "acceptance_criteria": [
+      "Scheduler Deployment runs and stays healthy",
+      "Starting 3 tasks with maxConcurrent=1 results in 1 running and 2 queued",
+      "When a running task finishes (status=done), the next queued task starts within 30s",
+      "Scheduler logs show which pods it releases",
+      "Scheduler handles empty queue gracefully (no errors when nothing to promote)"
+    ],
+    "files": [
+      "agents/scheduler/deployment.yaml",
+      "agents/scheduler/entrypoint.sh",
+      "agents/rbac.yaml (update with list/get permissions)"
+    ],
+    "labels": ["infrastructure", "kubernetes", "phase-3"],
+    "estimate": "M"
+  },
+  {
+    "id": "3.4",
+    "title": "Add Claude Code hooks for usage limit detection",
+    "description": "Implement detection of Claude API usage limit hits so pods can self-report their rate-limited status.\n\nApproach: wrap the Claude invocation in the entrypoint with output parsing:\n\n```bash\nclaude --dangerously-skip-permissions ... 2>&1 | tee /workspace/.claude-output.log\nEXIT_CODE=${PIPESTATUS[0]}\n\n# Check output for rate limit signals\nif grep -qiE \"rate.?limit|usage.?limit|too many requests|overloaded\" \\\n    /workspace/.claude-output.log; then\n  COOLDOWN=$(kubectl get configmap worker-config ... rateLimitCooldownMinutes)\n  RETRY_AFTER=$(date -d \"+${COOLDOWN} minutes\" +%s)\n  kubectl annotate pod \"$HOSTNAME\" ccw/retry-after=\"$RETRY_AFTER\" --overwrite\n  kubectl label pod \"$HOSTNAME\" status=rate-limited --overwrite\n  echo \"Rate limit hit. Will retry after $(date -d @$RETRY_AFTER)\"\nelif [ $EXIT_CODE -eq 0 ]; then\n  kubectl label pod \"$HOSTNAME\" status=done --overwrite\nelse\n  kubectl label pod \"$HOSTNAME\" status=error --overwrite\nfi\n```\n\nAlso create `agents/base-image/hooks/on-stop.sh` as a Claude Code Stop hook (configured in `~/.claude/settings.json`) as a secondary detection mechanism.",
+    "acceptance_criteria": [
+      "When Claude output contains rate limit text, pod label changes to status=rate-limited",
+      "Pod annotation ccw/retry-after is set to a valid future Unix timestamp",
+      "Normal completion still sets status=done",
+      "Error exits still set status=error",
+      "Rate limit detection is case-insensitive and matches common variations"
+    ],
+    "files": [
+      "agents/base-image/entrypoint.sh (update exit handling)",
+      "agents/base-image/hooks/on-stop.sh",
+      "agents/base-image/Dockerfile (copy hooks, configure settings.json)"
+    ],
+    "labels": ["infrastructure", "bash", "phase-3"],
+    "estimate": "S"
+  },
+  {
+    "id": "3.5",
+    "title": "Implement rate limit recovery in scheduler",
+    "description": "Extend the scheduler loop to re-queue rate-limited pods when their cooldown expires.\n\nAddition to scheduler loop:\n```bash\n# Check rate-limited pods\nfor POD in $(kubectl get pods -n claude-workers -l status=rate-limited ...):\n  RETRY_AFTER=$(kubectl get pod $POD ... annotation ccw/retry-after)\n  NOW=$(date +%s)\n  if [ $NOW -gt $RETRY_AFTER ]; then\n    kubectl label pod $POD status=queued --overwrite\n    echo \"Re-queued after rate limit cooldown: $POD\"\n  fi\ndone\n```\n\nWhen a rate-limited pod is re-queued and then released by the scheduler, the entrypoint needs to resume Claude rather than starting fresh. The entrypoint should check for a saved session ID at `/tmp/claude-session-id`. If found, use `claude --resume <id>`. Session ID capture is implemented fully in Phase 4; this ticket adds the re-queue mechanism only.",
+    "acceptance_criteria": [
+      "A pod with status=rate-limited and an expired ccw/retry-after annotation gets re-queued",
+      "Re-queued pod follows normal queue flow (waits for concurrency slot)",
+      "Scheduler logs show re-queue events",
+      "Pods with future retry-after timestamps are not re-queued early"
+    ],
+    "files": [
+      "agents/scheduler/entrypoint.sh (update)"
+    ],
+    "labels": ["infrastructure", "bash", "phase-3"],
+    "estimate": "S"
+  },
+  {
+    "id": "3.6",
+    "title": "Add `ccw queue` CLI subcommand",
+    "description": "Implement `ccw queue` to show the current state of the queue and allow adjusting concurrency.\n\n`ccw queue` — show queue status:\n```\nQueue Status\n  Running:      2/2 (at limit)\n  Queued:       3\n  Rate-limited: 1 (retry in 2h 15m)\n\nQueued tasks (oldest first):\n  other-app-20240315-c1d2    feat/refactor    queued 45m\n  third-20240315-e4f5        main             queued 32m\n```\n\n`ccw queue set-limit <n>` — update maxConcurrent in the ConfigMap:\n```bash\nkubectl patch configmap worker-config -n claude-workers \\\n  --patch \"{\\\"data\\\":{\\\"maxConcurrent\\\":\\\"$n\\\"}}\"\n```\n\n`ccw queue promote <task>` — immediately release a specific queued task (bypass normal ordering).",
+    "acceptance_criteria": [
+      "`ccw queue` shows running/queued/rate-limited counts",
+      "`ccw queue` shows time until rate-limited pods retry",
+      "`ccw queue set-limit 3` updates maxConcurrent in the ConfigMap",
+      "`ccw queue promote <task>` immediately releases a queued pod",
+      "All output is readable and consistently formatted"
+    ],
+    "files": [
+      "agents/cli/ccw (queue subcommand)"
+    ],
+    "labels": ["cli", "bash", "phase-3"],
+    "estimate": "S"
+  }
+]

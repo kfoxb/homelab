@@ -1,0 +1,107 @@
+[
+  {
+    "id": "1.1",
+    "title": "Create claude-workers namespace and secrets manifest",
+    "description": "Create the Kubernetes namespace and a Secret template for credentials needed by worker pods.",
+    "acceptance_criteria": [
+      "`kubectl apply -f agents/namespace.yaml` creates the `claude-workers` namespace",
+      "`agents/secrets.yaml.example` exists and documents all required fields: `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`",
+      "`agents/secrets.yaml` is listed in `.gitignore` so actual credentials are never committed",
+      "README explains how to apply the real secret manually"
+    ],
+    "files": [
+      "agents/namespace.yaml",
+      "agents/secrets.yaml.example",
+      ".gitignore (update)"
+    ],
+    "labels": ["infrastructure", "kubernetes", "phase-1"],
+    "estimate": "XS"
+  },
+  {
+    "id": "1.2",
+    "title": "Build claude-worker base Dockerfile",
+    "description": "Create the base container image that all worker pods will use. It should include Claude Code CLI, tmux, git, GitHub CLI, jq, and the user's dotfiles from github.com/kfoxb/dotfiles.\n\nBase from `mcr.microsoft.com/devcontainers/base:bullseye`. Install Node.js 20 via nodesource or nvm. Install `@anthropic-ai/claude-code` globally via npm. Create non-root user `claude` with sudo. Clone and run dotfiles install at build time.",
+    "acceptance_criteria": [
+      "Image builds successfully without errors",
+      "Running `claude --version` inside the container works",
+      "Running `tmux -V`, `git --version`, `gh --version`, `jq --version` all work",
+      "Dotfiles directory is present in the `claude` user's home directory",
+      "Container runs as non-root user `claude` by default"
+    ],
+    "files": [
+      "agents/base-image/Dockerfile",
+      "agents/base-image/README.md"
+    ],
+    "labels": ["infrastructure", "docker", "phase-1"],
+    "estimate": "S"
+  },
+  {
+    "id": "1.3",
+    "title": "Write pod entrypoint script",
+    "description": "Write `entrypoint.sh` that runs when a worker pod starts. It orchestrates the full Claude Code session lifecycle.\n\nSteps:\n1. Configure git credential store from `GITHUB_TOKEN` env var (write to `~/.git-credentials`)\n2. Clone `$REPO_URL` into `/workspace/`\n3. Checkout `$GIT_BRANCH`; if branch doesn't exist remotely, create it from the default branch\n4. Start a tmux session named `claude` running Claude Code in headless mode: `claude --dangerously-skip-permissions --output-format stream-json 2>&1 | tee /workspace/.claude-output.log`\n5. Background monitor: poll for tmux session exit, write `/tmp/claude-done` with exit code, use `kubectl label` to update pod status label to `done` or `error`\n6. Keep container alive: `wait` or `tail -f /dev/null` so pod doesn't exit after Claude finishes\n7. Handle `SIGTERM` gracefully: send SIGTERM to Claude process, wait for it to finish, then exit",
+    "acceptance_criteria": [
+      "Pod starts and git clone completes successfully for a test repo",
+      "Claude Code runs inside a tmux session named `claude`",
+      "`kubectl exec -it <pod> -- tmux attach -t claude` attaches to the session",
+      "Container stays alive after Claude finishes",
+      "Pod label `status` changes to `done` when Claude exits cleanly",
+      "Pod label `status` changes to `error` when Claude exits with non-zero code",
+      "SIGTERM causes graceful shutdown within 30 seconds"
+    ],
+    "files": [
+      "agents/base-image/entrypoint.sh",
+      "agents/base-image/Dockerfile (update ENTRYPOINT)"
+    ],
+    "labels": ["infrastructure", "bash", "phase-1"],
+    "estimate": "M"
+  },
+  {
+    "id": "1.4",
+    "title": "Create pod manifest template",
+    "description": "Create a Kubernetes Pod manifest template that is parameterized via environment variables and `envsubst`.\n\nRequired env vars for substitution: `TASK_NAME`, `REPO_URL`, `REPO_SLUG`, `GIT_BRANCH`, `LINEAR_TICKET`.\n\nThe manifest should:\n- Use the base claude-worker image\n- Set namespace `claude-workers`\n- Include labels: `app=claude-worker`, `task`, `repo`, `branch`, `ticket`, `status=running`\n- Reference the `claude-worker-secrets` Secret for env vars\n- Set resource requests/limits (cpu: 500m/2000m, memory: 1Gi/4Gi)\n- Use the `claude-worker` ServiceAccount (from rbac.yaml)\n- Mount an `emptyDir` at `/workspace`",
+    "acceptance_criteria": [
+      "`envsubst < agents/pod-template.yaml | kubectl apply -f -` creates a pod in `claude-workers`",
+      "All required labels are present on the created pod",
+      "Pod has correct resource limits",
+      "Secrets are mounted as environment variables",
+      "Workspace emptyDir is mounted at /workspace"
+    ],
+    "files": [
+      "agents/pod-template.yaml"
+    ],
+    "labels": ["infrastructure", "kubernetes", "phase-1"],
+    "estimate": "S"
+  },
+  {
+    "id": "1.5",
+    "title": "Build and push base image (manual process)",
+    "description": "Create a build script that builds the base image and pushes it to a registry. For Phase 1 this is a manual process — the in-cluster registry isn't set up until Phase 5, so push to ghcr.io.\n\nThe script should:\n- Build the Dockerfile with a `latest` tag and a SHA-based tag\n- Push both tags\n- Document the required `docker login` for ghcr.io\n- Note that in Phase 5 this will be updated to also push to the local in-cluster registry",
+    "acceptance_criteria": [
+      "`bash agents/base-image/build.sh` builds and pushes the image without errors",
+      "Image is available at `ghcr.io/<org>/claude-worker:latest`",
+      "README documents the one-time setup (docker login, GITHUB_TOKEN for ghcr.io)"
+    ],
+    "files": [
+      "agents/base-image/build.sh",
+      "agents/base-image/README.md (update with build instructions)"
+    ],
+    "labels": ["infrastructure", "docker", "phase-1"],
+    "estimate": "XS"
+  },
+  {
+    "id": "1.6",
+    "title": "Create RBAC for pod self-labeling",
+    "description": "Worker pods need to update their own labels to reflect current status (running, done, error, rate-limited). Create a ServiceAccount with a Role that allows patching pods in the `claude-workers` namespace.\n\nThe entrypoint script uses `kubectl label pod $HOSTNAME <label>=<value>` to update status. For this to work without a kubeconfig file, the pod's ServiceAccount token (auto-mounted at /var/run/secrets/kubernetes.io/serviceaccount/) must have patch permissions on pods.\n\nCreate:\n- ServiceAccount `claude-worker` in `claude-workers` namespace\n- Role `claude-worker` with `patch` on `pods` resource\n- RoleBinding binding the ServiceAccount to the Role",
+    "acceptance_criteria": [
+      "`kubectl apply -f agents/rbac.yaml` creates ServiceAccount, Role, and RoleBinding",
+      "A pod running as the `claude-worker` ServiceAccount can run `kubectl label pod $HOSTNAME status=done` without error",
+      "The pod-template.yaml references `serviceAccountName: claude-worker`"
+    ],
+    "files": [
+      "agents/rbac.yaml",
+      "agents/pod-template.yaml (update serviceAccountName)"
+    ],
+    "labels": ["infrastructure", "kubernetes", "rbac", "phase-1"],
+    "estimate": "XS"
+  }
+]

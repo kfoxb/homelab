@@ -1,0 +1,112 @@
+[
+  {
+    "id": "5.1",
+    "title": "Deploy in-cluster container registry",
+    "description": "Deploy a Docker registry (registry:2) in the `claude-workers` namespace for caching built devcontainer images.\n\nComponents:\n- `registry/pvc.yaml` — 20Gi PVC using Longhorn StorageClass\n- `registry/deployment.yaml` — registry:2 Deployment mounting the PVC at `/var/lib/registry`\n- `registry/service.yaml` — ClusterIP service `registry` on port 5000\n\nThe full in-cluster hostname will be: `registry.claude-workers.svc.cluster.local:5000`\n\nResource limits: 200m CPU, 512Mi RAM (registry is mostly I/O bound).\n\nCreate a simple health check: `GET /v2/` should return 200.",
+    "acceptance_criteria": [
+      "`kubectl apply -f agents/registry/` creates the Deployment, Service, and PVC",
+      "Registry pod is Running and healthy",
+      "`curl http://registry.claude-workers.svc.cluster.local:5000/v2/` returns HTTP 200 from within the cluster",
+      "PVC is bound to a Longhorn volume",
+      "Data persists across registry pod restarts"
+    ],
+    "files": [
+      "agents/registry/deployment.yaml",
+      "agents/registry/service.yaml",
+      "agents/registry/pvc.yaml",
+      "agents/registry/README.md"
+    ],
+    "labels": ["infrastructure", "kubernetes", "registry", "phase-5"],
+    "estimate": "S"
+  },
+  {
+    "id": "5.2",
+    "title": "Configure K3s nodes for local registry",
+    "description": "Configure all three K3s nodes to trust and use the local in-cluster registry.\n\nK3s uses `/etc/rancher/k3s/registries.yaml` on each node to configure registry mirrors and credentials.\n\nRequired config on each node:\n```yaml\nmirrors:\n  \"registry.claude-workers.svc.cluster.local:5000\":\n    endpoint:\n      - \"http://registry.claude-workers.svc.cluster.local:5000\"\nconfigs:\n  \"registry.claude-workers.svc.cluster.local:5000\":\n    tls:\n      insecure_skip_verify: true\n```\n\nCreate `agents/scripts/setup-registry-nodes.sh` that:\n1. SSH into each node (beelink1/2/3 at 192.168.1.200-202 as user fox)\n2. Writes the registries.yaml config\n3. Restarts k3s (`sudo systemctl restart k3s`)\n4. Waits for node to be Ready again\n\nNote: Restarting k3s causes a brief workload disruption on that node. Script should restart one node at a time.",
+    "acceptance_criteria": [
+      "`bash agents/scripts/setup-registry-nodes.sh` configures all 3 nodes",
+      "After running, K3s pods on all nodes can pull from the local registry",
+      "Test: push a small test image to the registry, create a pod that uses it, confirm it starts",
+      "Script is idempotent (safe to run again)",
+      "Script handles already-configured nodes gracefully"
+    ],
+    "files": [
+      "agents/scripts/setup-registry-nodes.sh",
+      "agents/registry/README.md (update with setup instructions)"
+    ],
+    "labels": ["infrastructure", "bash", "k3s", "phase-5"],
+    "estimate": "S"
+  },
+  {
+    "id": "5.3",
+    "title": "Create overlay Dockerfile",
+    "description": "Create `agents/base-image/overlay.Dockerfile` — a Dockerfile that layers Claude Code tooling on top of any project devcontainer image.\n\n```dockerfile\nARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n\nUSER root\n\n# Install Claude Code (skip if already installed)\nRUN npm install -g @anthropic-ai/claude-code 2>/dev/null || \\\n    (curl -fsSL https://nodejs.org/dist/v20.x/node-v20.x-linux-x64.tar.gz | \\\n     tar -xz -C /usr/local --strip-components=1 && \\\n     npm install -g @anthropic-ai/claude-code)\n\n# Install required tools if not present\nRUN apt-get update && apt-get install -y tmux jq curl git \\\n    && rm -rf /var/lib/apt/lists/* 2>/dev/null || true\n\n# Install dotfiles\nRUN git clone https://github.com/kfoxb/dotfiles /tmp/dotfiles \\\n    && cd /tmp/dotfiles && bash install.sh \\\n    && rm -rf /tmp/dotfiles\n\n# Copy claude worker scripts\nCOPY entrypoint.sh /usr/local/bin/entrypoint.sh\nCOPY status-monitor.sh /usr/local/bin/status-monitor.sh\nCOPY hooks/ /root/.claude/hooks/\n\nRUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/status-monitor.sh\n\nENTRYPOINT [\"/usr/local/bin/entrypoint.sh\"]\n```\n\nThe overlay is deliberately defensive — it handles cases where the base image already has Node.js or some tools installed.",
+    "acceptance_criteria": [
+      "Overlay builds successfully on top of a minimal Ubuntu image",
+      "Overlay builds successfully on top of the existing homelab devcontainer image",
+      "Resulting image passes the same verification as the base image (claude, tmux, git, jq all work)",
+      "Build doesn't fail if base image already has Node.js or tmux installed",
+      "Image size is reasonable (documented in README)"
+    ],
+    "files": [
+      "agents/base-image/overlay.Dockerfile",
+      "agents/base-image/README.md (update with overlay build instructions)"
+    ],
+    "labels": ["infrastructure", "docker", "phase-5"],
+    "estimate": "S"
+  },
+  {
+    "id": "5.4",
+    "title": "Implement Kaniko build Job template",
+    "description": "Create `agents/build-job-template.yaml`, a Kubernetes Job template that builds a project devcontainer and applies the overlay using Kaniko.\n\nThe Job has two steps via init containers:\n\n**Init container 1** (`clone`): Clone the target repo to a shared emptyDir volume:\n```\ngit clone --depth=1 --branch $BUILD_REF $REPO_URL /workspace\n```\n\n**Init container 2** (`build-project`): Run Kaniko to build `.devcontainer/Dockerfile`:\n```\nkaniko --context=dir:///workspace \\\n       --dockerfile=/workspace/.devcontainer/Dockerfile \\\n       --destination=registry.../project-image:$PROJECT_HASH \\\n       --cache=true --cache-repo=registry.../cache\n```\n\n**Main container** (`build-overlay`): Run Kaniko to build the overlay:\n```\nkaniko --context=dir:///scripts \\\n       --dockerfile=/scripts/overlay.Dockerfile \\\n       --build-arg BASE_IMAGE=registry.../project-image:$PROJECT_HASH \\\n       --destination=registry.../project-image:$FINAL_TAG \\\n       --cache=true\n```\n\nParameterized env vars: `REPO_URL`, `BUILD_REF`, `PROJECT_HASH`, `FINAL_TAG`, `REPO_SLUG`.\n\nA ConfigMap mounts the overlay.Dockerfile and scripts into the build containers.\n\nResource limits: 2 CPU, 4Gi RAM (builds are CPU-intensive).",
+    "acceptance_criteria": [
+      "`envsubst < agents/build-job-template.yaml | kubectl apply -f -` creates a build Job",
+      "Job successfully builds a real project devcontainer (test with a simple Node.js project)",
+      "Final image is available in the local registry",
+      "Build logs are readable via `kubectl logs`",
+      "Job cleans up (TTL after completion: 1 hour)",
+      "If project has no `.devcontainer/Dockerfile`, job handles it gracefully (exits with clear error)"
+    ],
+    "files": [
+      "agents/build-job-template.yaml",
+      "agents/build-configmap.yaml (overlay.Dockerfile and scripts for Kaniko)"
+    ],
+    "labels": ["infrastructure", "kubernetes", "kaniko", "phase-5"],
+    "estimate": "M"
+  },
+  {
+    "id": "5.5",
+    "title": "Implement `ccw build` CLI subcommand",
+    "description": "Add `ccw build --repo <url> [--ref <branch/tag>]` to trigger and monitor image builds.\n\nFlow:\n1. Compute `PROJECT_HASH` from the Dockerfile contents:\n   - Clone repo to a temp dir, hash `.devcontainer/Dockerfile`\n   - Or use GitHub API to fetch file contents without cloning (faster)\n2. Check if image already exists in local registry:\n   `curl http://registry.../v2/<repo-slug>/manifests/<hash>` → 200 means cached\n3. If cached: print `Using cached image: registry.../<slug>:<hash>` and exit\n4. If not: create the Kaniko Job via `envsubst | kubectl apply`\n5. Wait for Job completion: poll `kubectl get job <name>` every 10s\n6. Stream logs: `kubectl logs -f -l job-name=<name> -c build-overlay`\n7. On success: print final image tag\n8. On failure: print error and logs\n\nAlso add `--no-cache` flag to force rebuild even if image exists.",
+    "acceptance_criteria": [
+      "`ccw build --repo <url>` builds and caches an image for a repo with a devcontainer",
+      "Running `ccw build` a second time with same repo/hash uses cache (prints cached message, no Job created)",
+      "`ccw build --no-cache` triggers a rebuild regardless of cache",
+      "Build logs stream to terminal while Job runs",
+      "Printed image tag can be used in `ccw start --image <tag>`",
+      "Error if repo has no `.devcontainer/Dockerfile`"
+    ],
+    "files": [
+      "agents/cli/ccw (build subcommand)"
+    ],
+    "labels": ["cli", "bash", "phase-5"],
+    "estimate": "M"
+  },
+  {
+    "id": "5.6",
+    "title": "Integrate auto-build into `ccw start`",
+    "description": "Update `ccw start` to automatically detect and use project-specific devcontainer images.\n\nAdditional logic in `ccw start`:\n1. If `--image <img>` is provided explicitly, use it (skip detection)\n2. Otherwise: probe the repo for `.devcontainer/Dockerfile` using GitHub API:\n   `curl -H \"Authorization: token $GITHUB_TOKEN\" \\\n        https://api.github.com/repos/<owner>/<repo>/contents/.devcontainer/Dockerfile`\n3. If found (HTTP 200): compute hash, check registry cache\n   - Cached: use the cached image\n   - Not cached: ask user \"No cached image found. Build now? [Y/n]\" (or `--auto-build` flag to skip prompt)\n   - If yes: run `ccw build --repo <url>` inline, use result\n4. If not found (HTTP 404): use the base `claude-worker` image\n\nThis keeps `ccw start` fast in the common case (image already cached) while being helpful when a build is needed.",
+    "acceptance_criteria": [
+      "`ccw start` on a repo with devcontainer uses the project-specific image (after building if needed)",
+      "`ccw start` on a repo without devcontainer uses base claude-worker image",
+      "With `--auto-build` flag, build happens without prompting",
+      "Cached image is used without rebuilding (fast path)",
+      "`ccw start --image <custom>` bypasses all detection"
+    ],
+    "files": [
+      "agents/cli/ccw (update start subcommand)"
+    ],
+    "labels": ["cli", "bash", "phase-5"],
+    "estimate": "S"
+  }
+]
