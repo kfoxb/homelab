@@ -3,9 +3,11 @@
 # Wraps kubectl operations for managing Claude Code agent pods.
 set -euo pipefail
 
-# ─── Resolve pod template path ───────────────────────────────────────────────
+# ─── Resolve template paths ───────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POD_TEMPLATE="${CCW_POD_TEMPLATE:-${SCRIPT_DIR}/../pod-template.yaml}"
+BUILD_JOB_TEMPLATE="${CCW_BUILD_JOB_TEMPLATE:-${SCRIPT_DIR}/../build-job-template.yaml}"
+REGISTRY="${CCW_REGISTRY:-registry.claude-workers.svc.cluster.local:5000}"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 usage() {
@@ -13,6 +15,7 @@ usage() {
 Usage: ccw <subcommand> [options]
 
 Subcommands:
+  build       Build a devcontainer image for a repository
   start       Start a new Claude Code worker task
   list        List all worker pods
   status      Show status of a task
@@ -38,6 +41,248 @@ die() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not found in PATH"
+}
+
+# ─── ccw build ────────────────────────────────────────────────────────────────
+cmd_build() {
+  local repo="" ref="main" no_cache=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)     repo="$2";  shift 2 ;;
+      --ref)      ref="$2";   shift 2 ;;
+      --no-cache) no_cache=1; shift ;;
+      --help|-h)
+        cat <<EOF
+Usage: ccw build --repo <url> [--ref <branch/tag>] [--no-cache]
+
+Build a devcontainer image for a repository and cache it in the local registry.
+The resulting image tag can be passed to 'ccw start --image <tag>'.
+
+Options:
+  --repo <url>       Git repository URL (required)
+  --ref <branch/tag> Branch or tag to build from (default: main)
+  --no-cache         Force rebuild even if image already exists in cache
+EOF
+        return 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  [[ -n "$repo" ]] || die "--repo is required"
+
+  require_cmd kubectl
+  require_cmd envsubst
+  require_cmd curl
+  require_cmd sha256sum
+
+  [[ -f "$BUILD_JOB_TEMPLATE" ]] || die "build job template not found: $BUILD_JOB_TEMPLATE"
+
+  # ── Derive repo slug from URL
+  local repo_slug
+  repo_slug="$(basename "$repo" .git | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
+
+  # ── Fetch Dockerfile contents to compute hash ──────────────────────────────
+  echo "Fetching .devcontainer/Dockerfile from ${repo} at ref ${ref} ..."
+  local dockerfile_content project_hash
+  dockerfile_content=""
+  project_hash=""
+
+  # Try GitHub API first for github.com URLs — faster than a full clone
+  if [[ "$repo" =~ github\.com[:/]([^/]+)/([^/\.]+)(\.git)?$ ]]; then
+    local gh_owner="${BASH_REMATCH[1]}"
+    local gh_repo="${BASH_REMATCH[2]}"
+    local auth_header=""
+    [[ -n "${GITHUB_TOKEN:-}" ]] && auth_header="-H Authorization: token ${GITHUB_TOKEN}"
+
+    local http_code
+    # Request raw file content; capture HTTP status on a separate last line
+    dockerfile_content="$(curl -sf \
+      -H "Accept: application/vnd.github.v3.raw" \
+      ${GITHUB_TOKEN:+-H "Authorization: token ${GITHUB_TOKEN}"} \
+      -w "\n__HTTP_STATUS__%{http_code}" \
+      "https://api.github.com/repos/${gh_owner}/${gh_repo}/contents/.devcontainer/Dockerfile?ref=${ref}" \
+      2>/dev/null)" || dockerfile_content=""
+
+    if [[ -n "$dockerfile_content" ]]; then
+      http_code="${dockerfile_content##*__HTTP_STATUS__}"
+      dockerfile_content="${dockerfile_content%__HTTP_STATUS__*}"
+
+      if [[ "$http_code" == "200" && -n "$dockerfile_content" ]]; then
+        project_hash="$(echo "$dockerfile_content" | sha256sum | cut -c1-12)"
+      elif [[ "$http_code" == "404" ]]; then
+        die "No .devcontainer/Dockerfile found in ${repo} at ref ${ref}"
+      else
+        # HTTP error other than 404 — fall through to clone
+        dockerfile_content=""
+      fi
+    fi
+  fi
+
+  # Fall back to cloning if the GitHub API path didn't produce a hash
+  if [[ -z "$project_hash" ]]; then
+    require_cmd git
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '${tmpdir}'" EXIT
+
+    echo "Cloning ${repo} (shallow) to compute Dockerfile hash ..."
+    git clone --depth=1 --branch "$ref" "$repo" "${tmpdir}/repo" >/dev/null 2>&1 \
+      || die "Failed to clone ${repo} at ref ${ref}"
+
+    [[ -f "${tmpdir}/repo/.devcontainer/Dockerfile" ]] \
+      || die "No .devcontainer/Dockerfile found in ${repo} at ref ${ref}"
+
+    project_hash="$(sha256sum "${tmpdir}/repo/.devcontainer/Dockerfile" | cut -c1-12)"
+  fi
+
+  echo "Dockerfile hash: ${project_hash}"
+
+  local final_tag="${project_hash}"
+  local final_image="${REGISTRY}/${repo_slug}:${final_tag}"
+
+  # ── Check if image is already cached in the registry ──────────────────────
+  if [[ "$no_cache" -eq 0 ]]; then
+    echo "Checking registry cache ..."
+
+    # The registry is a ClusterIP service; port-forward to reach it from outside.
+    local local_port=15099
+    kubectl port-forward svc/registry -n claude-workers "${local_port}:5000" \
+      >/dev/null 2>&1 &
+    local pf_pid=$!
+    # Ensure port-forward is killed on exit regardless of path taken
+    # shellcheck disable=SC2064
+    trap "kill ${pf_pid} 2>/dev/null || true; ${tmpdir:+rm -rf '${tmpdir}'}" EXIT
+
+    # Give port-forward a moment to establish
+    sleep 2
+
+    local manifest_http
+    manifest_http="$(curl -s -o /dev/null -w "%{http_code}" \
+      "http://localhost:${local_port}/v2/${repo_slug}/manifests/${final_tag}" \
+      2>/dev/null)" || manifest_http="000"
+
+    kill "$pf_pid" 2>/dev/null || true
+
+    if [[ "$manifest_http" == "200" ]]; then
+      echo "Using cached image: ${final_image}"
+      return 0
+    fi
+
+    echo "No cached image found — starting build."
+  fi
+
+  # ── Derive job name: build-<slug>-<hash> (max 63 chars) ───────────────────
+  local job_name
+  job_name="build-${repo_slug}-${project_hash}"
+  if [[ ${#job_name} -gt 63 ]]; then
+    # "build-" (6) + "-" (1) + hash (12) = 19 chars overhead; leave rest for slug
+    local max_slug_len=$(( 63 - 6 - 1 - ${#project_hash} ))
+    job_name="build-${repo_slug:0:$max_slug_len}-${project_hash}"
+    job_name="${job_name%-}"
+  fi
+
+  # ── Apply the Kaniko Job ───────────────────────────────────────────────────
+  echo "Creating build job: ${job_name}"
+
+  export REPO_URL="$repo"
+  export REPO_SLUG="$repo_slug"
+  export BUILD_REF="$ref"
+  export PROJECT_HASH="$project_hash"
+  export FINAL_TAG="$final_tag"
+
+  envsubst < "$BUILD_JOB_TEMPLATE" | kubectl apply -f -
+  echo ""
+
+  # ── Wait for the build pod to appear ──────────────────────────────────────
+  local pod_name=""
+  local waited=0
+  echo -n "Waiting for build pod"
+  while [[ -z "$pod_name" && $waited -lt 120 ]]; do
+    pod_name="$(kubectl get pods -n claude-workers \
+      -l "job-name=${job_name}" \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || pod_name=""
+    if [[ -z "$pod_name" ]]; then
+      echo -n "."
+      sleep 5
+      waited=$(( waited + 5 ))
+    fi
+  done
+  echo ""
+  [[ -n "$pod_name" ]] || die "Timed out waiting for build pod to appear"
+  echo "Build pod: ${pod_name}"
+  echo ""
+
+  # ── Stream logs for each stage in sequence ────────────────────────────────
+  # Helper: wait until a named container is no longer in the 'waiting' state.
+  _wait_for_container() {
+    local pod="$1" container="$2"
+    local w=0
+    while [[ $w -lt 600 ]]; do
+      local state
+      state="$(kubectl get pod -n claude-workers "$pod" \
+        -o jsonpath="{.status.initContainerStatuses[?(@.name==\"${container}\")].state.waiting.reason} \
+{.status.containerStatuses[?(@.name==\"${container}\")].state.waiting.reason}" \
+        2>/dev/null | tr -s ' ' | sed 's/^ //')" || state=""
+      # Empty state or no 'waiting' means it's running or terminated
+      if [[ -z "$state" || "$state" == " " ]]; then
+        return 0
+      fi
+      sleep 5
+      w=$(( w + 5 ))
+    done
+    return 1
+  }
+
+  echo "=== Stage 1/3: clone ==="
+  _wait_for_container "$pod_name" "clone" || die "Timed out waiting for clone container"
+  kubectl logs -n claude-workers -f "$pod_name" -c clone 2>/dev/null || true
+  echo ""
+
+  echo "=== Stage 2/3: build-project (devcontainer base image) ==="
+  _wait_for_container "$pod_name" "build-project" || die "Timed out waiting for build-project container"
+  kubectl logs -n claude-workers -f "$pod_name" -c build-project 2>/dev/null || true
+  echo ""
+
+  echo "=== Stage 3/3: build-overlay (Claude tooling layer) ==="
+  _wait_for_container "$pod_name" "build-overlay" || die "Timed out waiting for build-overlay container"
+  kubectl logs -n claude-workers -f -l "job-name=${job_name}" -c build-overlay 2>/dev/null || true
+  echo ""
+
+  # ── Poll for final job status (logs may exit before job status is recorded) ──
+  echo "Checking build result ..."
+  local job_status=""
+  local attempts=0
+  while [[ $attempts -lt 30 ]]; do
+    local succeeded failed
+    succeeded="$(kubectl get job -n claude-workers "$job_name" \
+      -o jsonpath='{.status.succeeded}' 2>/dev/null)" || succeeded=""
+    failed="$(kubectl get job -n claude-workers "$job_name" \
+      -o jsonpath='{.status.failed}' 2>/dev/null)" || failed=""
+
+    if [[ "${succeeded:-0}" -ge 1 ]]; then
+      job_status="succeeded"; break
+    elif [[ "${failed:-0}" -ge 1 ]]; then
+      job_status="failed"; break
+    fi
+
+    sleep 10
+    attempts=$(( attempts + 1 ))
+  done
+
+  if [[ "$job_status" == "succeeded" ]]; then
+    echo ""
+    echo "Build complete."
+    echo "Image: ${final_image}"
+  elif [[ "$job_status" == "failed" ]]; then
+    echo ""
+    echo "Build failed. Full logs:"
+    kubectl logs -n claude-workers -l "job-name=${job_name}" --all-containers=true 2>/dev/null || true
+    die "Build job ${job_name} failed"
+  else
+    die "Timed out waiting for build job ${job_name} to complete"
+  fi
 }
 
 # ─── ccw start ────────────────────────────────────────────────────────────────
@@ -1073,6 +1318,7 @@ subcommand="$1"
 shift
 
 case "$subcommand" in
+  build)       cmd_build "$@" ;;
   start)       cmd_start "$@" ;;
   --help|-h)   usage ;;
   list)        cmd_list "$@" ;;
