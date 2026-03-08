@@ -43,3 +43,9 @@ RUN git clone https://github.com/kfoxb/dotfiles /home/claude/dotfiles \
 
 USER claude
 WORKDIR /home/claude
+
+# Copy entrypoint
+COPY --chown=claude:claude entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN sudo chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
