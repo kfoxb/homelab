@@ -1,0 +1,16 @@
+# Secrets - never commit these
+*.secret.yaml
+*-secret.yaml
+.env
+.env.*
+
+# Kubeconfig
+kubeconfig*
+
+# Helm
+charts/
+*.tgz
+
+# OS
+.DS_Store
+Thumbs.db

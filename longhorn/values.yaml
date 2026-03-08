@@ -1,0 +1,8 @@
+defaultSettings:
+  # 2 replicas across 3 nodes: survive one node failure
+  # without burning 2/3 of total storage
+  defaultReplicaCount: 2
+
+persistence:
+  # Set Longhorn as the default StorageClass
+  defaultClass: true
