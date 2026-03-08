@@ -125,6 +125,77 @@ EOF
   echo "To monitor:   ccw logs ${task_name} --follow"
 }
 
+# ─── Shared helpers ───────────────────────────────────────────────────────────
+
+# format_age <ISO-8601-timestamp> → "14m" / "3h" / "2d"
+format_age() {
+  local ts="$1"
+  local epoch_ts epoch_now diff_s
+
+  epoch_ts="$(date -d "$ts" +%s 2>/dev/null)" \
+    || epoch_ts="$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null)" \
+    || { echo "?"; return; }
+  epoch_now="$(date +%s)"
+  diff_s=$(( epoch_now - epoch_ts ))
+
+  if (( diff_s < 3600 )); then
+    echo "$(( diff_s / 60 ))m"
+  elif (( diff_s < 86400 )); then
+    echo "$(( diff_s / 3600 ))h"
+  else
+    echo "$(( diff_s / 86400 ))d"
+  fi
+}
+
+# ─── ccw status ───────────────────────────────────────────────────────────────
+cmd_status() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: ccw status <task>"
+    echo ""
+    echo "Show detailed status and recent output for a task."
+    return 0
+  fi
+
+  local task="${1:-}"
+  [[ -n "$task" ]] || die "usage: ccw status <task>"
+
+  require_cmd kubectl
+  require_cmd jq
+
+  # Fetch pod JSON; kubectl exits non-zero if the pod doesn't exist
+  local pod_json
+  pod_json="$(kubectl get pod -n claude-workers "$task" -o json 2>/dev/null)" \
+    || die "task not found: ${task}"
+
+  # ── Extract fields from labels / spec / status
+  local status repo branch ticket node pod_ip created_at age
+  status="$(echo "$pod_json"    | jq -r '.metadata.labels.status // "unknown"')"
+  repo="$(echo "$pod_json"      | jq -r '.metadata.labels["repo-url"] // .metadata.labels.repo // "-"')"
+  branch="$(echo "$pod_json"    | jq -r '.metadata.labels.branch // "-"')"
+  ticket="$(echo "$pod_json"    | jq -r '.metadata.labels.ticket // "-"')"
+  node="$(echo "$pod_json"      | jq -r '.spec.nodeName // "-"')"
+  pod_ip="$(echo "$pod_json"    | jq -r '.status.podIP // "-"')"
+  created_at="$(echo "$pod_json" | jq -r '.metadata.creationTimestamp')"
+  age="$(format_age "$created_at")"
+
+  # ── Print metadata block
+  printf "Task:     %s\n"   "$task"
+  printf "Status:   %s\n"   "$status"
+  printf "Repo:     %s\n"   "$repo"
+  printf "Branch:   %s\n"   "$branch"
+  printf "Ticket:   %s\n"   "$ticket"
+  printf "Node:     %s\n"   "$node"
+  printf "Age:      %s\n"   "$age"
+  printf "Pod IP:   %s\n"   "$pod_ip"
+
+  # ── Fetch recent output (skip gracefully if log doesn't exist yet)
+  echo ""
+  echo "--- Recent output (last 30 lines) ---"
+  kubectl exec -n claude-workers "$task" -- \
+    tail -n 30 /workspace/.claude-output.log 2>/dev/null \
+    || echo "(no output log yet)"
+}
+
 # ─── ccw list ─────────────────────────────────────────────────────────────────
 cmd_list() {
   if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -166,26 +237,6 @@ cmd_list() {
     echo "No worker pods found."
     return 0
   fi
-
-  # ── Format age from an ISO-8601 timestamp to Xm / Xh / Xd
-  # Usage: format_age <timestamp>
-  format_age() {
-    local ts="$1"
-    local now epoch_now epoch_ts diff_s
-
-    # Convert timestamp to epoch seconds (works on GNU date)
-    epoch_ts="$(date -d "$ts" +%s 2>/dev/null)" || epoch_ts="$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null)" || { echo "?"; return; }
-    epoch_now="$(date +%s)"
-    diff_s=$(( epoch_now - epoch_ts ))
-
-    if (( diff_s < 3600 )); then
-      echo "$(( diff_s / 60 ))m"
-    elif (( diff_s < 86400 )); then
-      echo "$(( diff_s / 3600 ))h"
-    else
-      echo "$(( diff_s / 86400 ))d"
-    fi
-  }
 
   # ── Color a status value
   color_status() {
@@ -249,7 +300,8 @@ case "$subcommand" in
   start)       cmd_start "$@" ;;
   --help|-h)   usage ;;
   list)        cmd_list "$@" ;;
-  status|ssh|shell|logs|stop|dismiss|dismiss-all)
+  status)      cmd_status "$@" ;;
+  ssh|shell|logs|stop|dismiss|dismiss-all)
     die "subcommand '${subcommand}' is not yet implemented" ;;
   *)
     die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
