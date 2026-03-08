@@ -233,6 +233,11 @@ while true; do
     continue
   fi
 
+  # ── Run completion hook for Linear integration ──────────────────────────────
+  if [[ "${STATUS}" == "done" ]]; then
+    /usr/local/bin/on-complete.sh || true
+  fi
+
   echo "Claude exited with code ${EXIT_CODE} — updating pod label status=${STATUS}"
   kubectl label pod "${HOSTNAME}" \
     -n "${POD_NAMESPACE:-claude-workers}" \

@@ -51,9 +51,13 @@ RUN sudo chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/status-monitor.sh
 
 # Copy hooks and configure Claude Code settings.json to register the Stop hook
 COPY --chown=claude:claude hooks/ /home/claude/.claude/hooks/
-RUN chmod +x /home/claude/.claude/hooks/on-stop.sh \
+RUN chmod +x /home/claude/.claude/hooks/on-stop.sh /home/claude/.claude/hooks/on-complete.sh \
     && mkdir -p /home/claude/.claude \
     && echo '{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"/home/claude/.claude/hooks/on-stop.sh"}]}]}}' \
        > /home/claude/.claude/settings.json
+
+# Install on-complete hook where the entrypoint can call it
+RUN sudo cp /home/claude/.claude/hooks/on-complete.sh /usr/local/bin/on-complete.sh \
+    && sudo chmod +x /usr/local/bin/on-complete.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
