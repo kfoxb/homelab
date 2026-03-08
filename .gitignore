@@ -1,6 +1,7 @@
 # Secrets - never commit these
 *.secret.yaml
 *-secret.yaml
+agents/secrets.yaml
 .env
 .env.*
 
