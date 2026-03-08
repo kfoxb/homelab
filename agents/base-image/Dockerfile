@@ -48,4 +48,11 @@ WORKDIR /home/claude
 COPY --chown=claude:claude entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sudo chmod +x /usr/local/bin/entrypoint.sh
 
+# Copy hooks and configure Claude Code settings.json to register the Stop hook
+COPY --chown=claude:claude hooks/ /home/claude/.claude/hooks/
+RUN chmod +x /home/claude/.claude/hooks/on-stop.sh \
+    && mkdir -p /home/claude/.claude \
+    && echo '{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"/home/claude/.claude/hooks/on-stop.sh"}]}]}}' \
+       > /home/claude/.claude/settings.json
+
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

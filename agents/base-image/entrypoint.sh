@@ -78,7 +78,29 @@ _monitor() {
 
   echo "${EXIT_CODE}" > /tmp/claude-done
 
-  if [[ "${EXIT_CODE}" -eq 0 ]]; then
+  # Check output log for rate limit signals (case-insensitive)
+  RATE_LIMITED=false
+  if [[ -f /workspace/.claude-output.log ]]; then
+    if grep -qiE "rate.?limit|usage.?limit|too many requests|overloaded" \
+        /workspace/.claude-output.log; then
+      RATE_LIMITED=true
+    fi
+  fi
+
+  if [[ "${RATE_LIMITED}" == "true" ]]; then
+    STATUS="rate-limited"
+    # Read cooldown from worker-config, default 300 minutes (5 hours)
+    COOLDOWN=$(kubectl get configmap worker-config \
+      -n "${POD_NAMESPACE:-claude-workers}" \
+      -o jsonpath='{.data.rateLimitCooldownMinutes}' 2>/dev/null || echo "300")
+    RETRY_AFTER=$(date -d "+${COOLDOWN} minutes" +%s)
+    echo "Rate limit hit — annotating pod with retry-after=${RETRY_AFTER}"
+    kubectl annotate pod "${HOSTNAME}" \
+      -n "${POD_NAMESPACE:-claude-workers}" \
+      "ccw/retry-after=${RETRY_AFTER}" \
+      --overwrite 2>/dev/null || \
+      echo "Warning: could not annotate pod"
+  elif [[ "${EXIT_CODE}" -eq 0 ]]; then
     STATUS="done"
   else
     STATUS="error"
