@@ -44,9 +44,10 @@ RUN git clone https://github.com/kfoxb/dotfiles /home/claude/dotfiles \
 USER claude
 WORKDIR /home/claude
 
-# Copy entrypoint
+# Copy entrypoint and status monitor
 COPY --chown=claude:claude entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN sudo chmod +x /usr/local/bin/entrypoint.sh
+COPY --chown=claude:claude status-monitor.sh /usr/local/bin/status-monitor.sh
+RUN sudo chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/status-monitor.sh
 
 # Copy hooks and configure Claude Code settings.json to register the Stop hook
 COPY --chown=claude:claude hooks/ /home/claude/.claude/hooks/
