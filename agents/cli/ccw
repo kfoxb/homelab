@@ -24,6 +24,7 @@ Subcommands:
   dismiss-all Delete all task pods
   queue       Show queue status and manage concurrency
   follow-up   Send a follow-up message to a Claude session
+  history     Show event history for a task (or all tasks)
 
 Run 'ccw <subcommand> --help' for subcommand-specific options.
 EOF
@@ -817,6 +818,149 @@ EOF
       bash -c "cat >> /workspace/.claude-events.log" 2>/dev/null || true
 }
 
+# ─── ccw history ──────────────────────────────────────────────────────────────
+cmd_history() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    cat <<EOF
+Usage: ccw history [<task>]
+
+  ccw history <task>   Show all events for the specified task
+  ccw history          Show last 50 events across all running/recent pods
+
+Event colors: STARTED=blue  DONE=green  ERROR=red  RATE_LIMITED=yellow
+EOF
+    return 0
+  fi
+
+  require_cmd kubectl
+
+  # Color setup (only when stdout is a TTY)
+  local c_reset="" c_green="" c_red="" c_yellow="" c_blue=""
+  if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+    c_reset="$(tput sgr0)"
+    c_green="$(tput setaf 2)"
+    c_red="$(tput setaf 1)"
+    c_yellow="$(tput setaf 3)"
+    c_blue="$(tput setaf 4)"
+  fi
+
+  local task="${1:-}"
+
+  if [[ -n "$task" ]]; then
+    # ── Single-task history ──────────────────────────────────────────────────
+    kubectl get pod -n claude-workers "$task" >/dev/null 2>&1 \
+      || die "task not found: ${task}"
+
+    local log_content
+    log_content="$(kubectl exec -n claude-workers "$task" -- \
+      cat /workspace/.claude-events.log 2>/dev/null)" \
+      || die "event log not found (pod may still be starting)"
+
+    if [[ -z "$log_content" ]]; then
+      echo "(no events yet)"
+      return 0
+    fi
+
+    # BRANCH_CHECKED_OUT is 18 chars — widest expected event type
+    local EVENT_TYPE_WIDTH=18
+
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+
+      # Parse: TIMESTAMP EVENT_TYPE [rest...]
+      local ts="${line%% *}"
+      local remainder="${line#* }"
+      local event_type="${remainder%% *}"
+      local rest="${remainder#* }"
+      # When event_type has no trailing fields, rest == event_type
+      [[ "$rest" == "$event_type" ]] && rest=""
+
+      # Format: "2024-03-15T10:00:00Z" → "2024-03-15 10:00:00"
+      local display_ts="${ts%Z}"
+      display_ts="${display_ts/T/ }"
+
+      local colored_et
+      case "$event_type" in
+        STARTED)      colored_et="${c_blue}${event_type}${c_reset}" ;;
+        *DONE*)       colored_et="${c_green}${event_type}${c_reset}" ;;
+        *ERROR*)      colored_et="${c_red}${event_type}${c_reset}" ;;
+        RATE_LIMITED) colored_et="${c_yellow}${event_type}${c_reset}" ;;
+        *)            colored_et="${event_type}" ;;
+      esac
+
+      # Compensate printf field width for invisible color escape codes
+      local plain_len=${#event_type}
+      local colored_len=${#colored_et}
+      local pad=$(( EVENT_TYPE_WIDTH + colored_len - plain_len ))
+
+      printf "%-21s  %-${pad}s  %s\n" "$display_ts" "$colored_et" "$rest"
+    done <<< "$log_content"
+
+  else
+    # ── Aggregate history: last 50 events across all pods ────────────────────
+    require_cmd jq
+
+    local pods_json
+    pods_json="$(kubectl get pods -n claude-workers -l app=claude-worker -o json 2>/dev/null)" \
+      || die "failed to query pods (is kubectl configured?)"
+
+    local pod_count
+    pod_count="$(echo "$pods_json" | jq '.items | length')"
+
+    if [[ "$pod_count" -eq 0 ]]; then
+      echo "No worker pods found."
+      return 0
+    fi
+
+    # Collect events as tab-separated: TIMESTAMP\tPOD_NAME\tEVENT_TYPE\tREST
+    # ISO 8601 timestamps are lexicographically sortable, so plain sort works.
+    local all_events=""
+    while IFS= read -r pod_name; do
+      local events
+      events="$(kubectl exec -n claude-workers "$pod_name" -- \
+        cat /workspace/.claude-events.log 2>/dev/null)" || continue
+      [[ -z "$events" ]] && continue
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local ts="${line%% *}"
+        local remainder="${line#* }"
+        local event_type="${remainder%% *}"
+        local rest="${remainder#* }"
+        [[ "$rest" == "$event_type" ]] && rest=""
+        all_events+="${ts}"$'\t'"${pod_name}"$'\t'"${event_type}"$'\t'"${rest}"$'\n'
+      done <<< "$events"
+    done < <(echo "$pods_json" | jq -r '.items[].metadata.name')
+
+    if [[ -z "$all_events" ]]; then
+      echo "No events found across any pods."
+      return 0
+    fi
+
+    # Sort by timestamp, take last 50, then format and color each line
+    while IFS=$'\t' read -r ts pod_name event_type rest; do
+      [[ -z "$ts" ]] && continue
+
+      # Show only the time portion: "2024-03-15T10:00:00Z" → "10:00:00"
+      local time_part="${ts%Z}"
+      time_part="${time_part#*T}"
+
+      local colored_et
+      case "$event_type" in
+        STARTED)      colored_et="${c_blue}${event_type}${c_reset}" ;;
+        *DONE*)       colored_et="${c_green}${event_type}${c_reset}" ;;
+        *ERROR*)      colored_et="${c_red}${event_type}${c_reset}" ;;
+        RATE_LIMITED) colored_et="${c_yellow}${event_type}${c_reset}" ;;
+        *)            colored_et="${event_type}" ;;
+      esac
+
+      local pod_label="[${pod_name}]"
+      printf "%-37s  %-10s  %s" "$pod_label" "$time_part" "$colored_et"
+      [[ -n "$rest" ]] && printf "  %s" "$rest"
+      printf '\n'
+    done < <(echo "$all_events" | sort -t$'\t' -k1,1 | tail -n 50)
+  fi
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
   usage
@@ -840,6 +984,7 @@ case "$subcommand" in
   dismiss-all) cmd_dismiss_all "$@" ;;
   queue)       cmd_queue "$@" ;;
   follow-up)   cmd_follow_up "$@" ;;
+  history)     cmd_history "$@" ;;
   *)
     die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
 esac
