@@ -285,27 +285,142 @@ EOF
   fi
 }
 
+# ─── ccw start: image auto-detection ─────────────────────────────────────────
+# Probes the repo for .devcontainer/Dockerfile via the GitHub API.
+# If found: checks the local registry cache; returns cached image tag if hit,
+# otherwise triggers a build (prompting the user unless auto_build=1).
+# If not found: returns the base claude-worker image.
+# Prints the image to use on stdout; all status messages go to stderr.
+_start_detect_image() {
+  local repo="$1" ref="$2" repo_slug="$3" auto_build="$4"
+  local base_image="ghcr.io/kfoxb/claude-worker:latest"
+
+  # Only support GitHub API probing for github.com URLs; fall back to base image
+  # for other hosts (no way to quickly probe without cloning).
+  if [[ ! "$repo" =~ github\.com[:/]([^/]+)/([^/\.]+)(\.git)?$ ]]; then
+    echo "$base_image"
+    return 0
+  fi
+
+  local gh_owner="${BASH_REMATCH[1]}"
+  local gh_repo="${BASH_REMATCH[2]}"
+
+  # ── Probe for .devcontainer/Dockerfile via GitHub Contents API ──────────────
+  echo "Probing ${gh_owner}/${gh_repo} for .devcontainer/Dockerfile ..." >&2
+
+  local probe_output http_code dockerfile_content
+  probe_output="$(curl -sf \
+    -H "Accept: application/vnd.github.v3.raw" \
+    ${GITHUB_TOKEN:+-H "Authorization: token ${GITHUB_TOKEN}"} \
+    -w "\n__HTTP_STATUS__%{http_code}" \
+    "https://api.github.com/repos/${gh_owner}/${gh_repo}/contents/.devcontainer/Dockerfile?ref=${ref}" \
+    2>/dev/null)" || probe_output=""
+
+  if [[ -z "$probe_output" ]]; then
+    # Network error or non-2xx without -f catching it — treat as no devcontainer
+    echo "Could not reach GitHub API; using base image." >&2
+    echo "$base_image"
+    return 0
+  fi
+
+  http_code="${probe_output##*__HTTP_STATUS__}"
+  dockerfile_content="${probe_output%__HTTP_STATUS__*}"
+
+  if [[ "$http_code" == "404" || -z "$dockerfile_content" ]]; then
+    echo "No .devcontainer/Dockerfile found; using base claude-worker image." >&2
+    echo "$base_image"
+    return 0
+  fi
+
+  if [[ "$http_code" != "200" ]]; then
+    echo "GitHub API returned HTTP ${http_code}; using base image." >&2
+    echo "$base_image"
+    return 0
+  fi
+
+  # ── Compute hash and candidate image tag ────────────────────────────────────
+  local project_hash final_tag final_image
+  project_hash="$(echo "$dockerfile_content" | sha256sum | cut -c1-12)"
+  final_tag="$project_hash"
+  final_image="${REGISTRY}/${repo_slug}:${final_tag}"
+
+  echo "Devcontainer Dockerfile found (hash: ${project_hash})." >&2
+
+  # ── Check registry cache via a short-lived port-forward ─────────────────────
+  local local_port=15099
+  kubectl port-forward svc/registry -n claude-workers "${local_port}:5000" \
+    >/dev/null 2>&1 &
+  local pf_pid=$!
+  # shellcheck disable=SC2064
+  trap "kill ${pf_pid} 2>/dev/null || true" RETURN
+
+  sleep 2  # let the tunnel establish
+
+  local manifest_http
+  manifest_http="$(curl -s -o /dev/null -w "%{http_code}" \
+    "http://localhost:${local_port}/v2/${repo_slug}/manifests/${final_tag}" \
+    2>/dev/null)" || manifest_http="000"
+
+  kill "$pf_pid" 2>/dev/null || true
+
+  if [[ "$manifest_http" == "200" ]]; then
+    echo "Using cached image: ${final_image}" >&2
+    echo "$final_image"
+    return 0
+  fi
+
+  # ── No cache hit — decide whether to build ──────────────────────────────────
+  echo "No cached image found for ${final_image}." >&2
+
+  local do_build=0
+  if [[ "$auto_build" -eq 1 ]]; then
+    do_build=1
+  else
+    # Prompt interactively (default yes)
+    local answer
+    read -r -p "Build devcontainer image now? [Y/n] " answer </dev/tty || answer="y"
+    case "${answer,,}" in
+      ""|y|yes) do_build=1 ;;
+      *)        do_build=0 ;;
+    esac
+  fi
+
+  if [[ "$do_build" -eq 1 ]]; then
+    echo "Building image (this may take several minutes) ..." >&2
+    # cmd_build is defined in this same script; call it directly.
+    # Redirect its stdout to stderr so only the final image tag reaches our caller.
+    cmd_build --repo "$repo" --ref "$ref" >&2 \
+      || die "devcontainer build failed"
+    echo "$final_image"
+  else
+    echo "Skipping build; falling back to base claude-worker image." >&2
+    echo "$base_image"
+  fi
+}
+
 # ─── ccw start ────────────────────────────────────────────────────────────────
 cmd_start() {
-  local repo="" branch="" prompt="" ticket="" image=""
+  local repo="" branch="" prompt="" ticket="" image="" auto_build=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --repo)    repo="$2";   shift 2 ;;
-      --branch)  branch="$2"; shift 2 ;;
-      --prompt)  prompt="$2"; shift 2 ;;
-      --ticket)  ticket="$2"; shift 2 ;;
-      --image)   image="$2";  shift 2 ;;
+      --repo)        repo="$2";   shift 2 ;;
+      --branch)      branch="$2"; shift 2 ;;
+      --prompt)      prompt="$2"; shift 2 ;;
+      --ticket)      ticket="$2"; shift 2 ;;
+      --image)       image="$2";  shift 2 ;;
+      --auto-build)  auto_build=1; shift ;;
       --help|-h)
         cat <<EOF
 Usage: ccw start --repo <url> --branch <name> --prompt <text> [options]
 
 Options:
-  --repo    <url>    Git repository URL (required)
-  --branch  <name>  Branch to work on, created if absent (required)
-  --prompt  <text>  Initial prompt for Claude (required)
-  --ticket  <id>    Linear ticket ID (optional)
-  --image   <image> Override container image (optional)
+  --repo         <url>    Git repository URL (required)
+  --branch       <name>   Branch to work on, created if absent (required)
+  --prompt       <text>   Initial prompt for Claude (required)
+  --ticket       <id>     Linear ticket ID (optional)
+  --image        <image>  Override container image; skips auto-detection (optional)
+  --auto-build            Build devcontainer image without prompting if not cached
 EOF
         return 0 ;;
       *) die "unknown argument: $1" ;;
@@ -324,6 +439,11 @@ EOF
   # ── Derive repo slug from URL (last path component, lowercase, alnum+hyphens)
   local raw_slug
   raw_slug="$(basename "$repo" .git | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
+
+  # ── Auto-detect devcontainer image (skipped if --image was given explicitly)
+  if [[ -z "$image" ]]; then
+    image="$(_start_detect_image "$repo" "$branch" "$raw_slug" "$auto_build")"
+  fi
 
   # ── Generate task name: <slug>-<yyyymmdd>-<4-char-random>
   # Fixed suffix length: -YYYYMMDD-XXXX = 14 chars; leave room for slug.
@@ -357,7 +477,7 @@ EOF
   export GIT_BRANCH="$branch"
   export GIT_BRANCH_LABEL="$branch_label"
   export LINEAR_TICKET="${ticket:-none}"
-  export CLAUDE_IMAGE="${image:-ghcr.io/kfoxb/claude-worker:latest}"
+  export CLAUDE_IMAGE="$image"
 
   # ── Create ConfigMap for the prompt (avoids YAML-injection of arbitrary text)
   kubectl create configmap "${task_name}-prompt" \
