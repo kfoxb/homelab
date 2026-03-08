@@ -391,6 +391,166 @@ EOF
   fi
 }
 
+# ─── ccw stop ─────────────────────────────────────────────────────────────────
+cmd_stop() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: ccw stop <task>"
+    echo ""
+    echo "Send SIGTERM to Claude inside the pod and mark the task as stopped."
+    echo "The pod remains alive. Use 'ccw dismiss <task>' to remove it."
+    return 0
+  fi
+
+  local task="${1:-}"
+  [[ -n "$task" ]] || die "usage: ccw stop <task>"
+
+  require_cmd kubectl
+
+  kubectl get pod -n claude-workers "$task" >/dev/null 2>&1 \
+    || die "task not found: ${task}"
+
+  # Send SIGTERM to the claude process
+  kubectl exec -n claude-workers "$task" -- pkill -SIGTERM -f 'claude' 2>/dev/null || true
+
+  # Update status label to stopped
+  kubectl label pod -n claude-workers "$task" status=stopped --overwrite >/dev/null
+
+  echo "Claude stopped. Pod is still running. Use \`ccw dismiss ${task}\` to remove it."
+}
+
+# ─── ccw dismiss ──────────────────────────────────────────────────────────────
+cmd_dismiss() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: ccw dismiss <task>"
+    echo ""
+    echo "Delete a task pod. Prompts for confirmation if the task is running."
+    return 0
+  fi
+
+  local task="${1:-}"
+  [[ -n "$task" ]] || die "usage: ccw dismiss <task>"
+
+  require_cmd kubectl
+
+  kubectl get pod -n claude-workers "$task" >/dev/null 2>&1 \
+    || die "task not found: ${task}"
+
+  local status
+  status="$(kubectl get pod -n claude-workers "$task" \
+    -o jsonpath='{.metadata.labels.status}' 2>/dev/null)"
+
+  if [[ "$status" == "running" ]]; then
+    printf "Task is still running. Dismiss anyway? [y/N] "
+    read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { echo "Aborted."; return 0; }
+  fi
+
+  kubectl delete pod -n claude-workers "$task"
+}
+
+# ─── ccw dismiss-all ──────────────────────────────────────────────────────────
+cmd_dismiss_all() {
+  local include_running=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --include-running) include_running=1; shift ;;
+      --help|-h)
+        cat <<EOF
+Usage: ccw dismiss-all [--include-running]
+
+Delete all task pods with status done or error.
+
+Options:
+  --include-running  Also delete running pods (prompts for confirmation)
+EOF
+        return 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  require_cmd kubectl
+  require_cmd jq
+
+  local pods_json
+  pods_json="$(kubectl get pods -n claude-workers -l app=claude-worker -o json 2>/dev/null)"
+
+  # Collect done/error pods
+  local done_pods=()
+  while IFS= read -r name; do
+    done_pods+=("$name")
+  done < <(echo "$pods_json" | jq -r '.items[] | select(.metadata.labels.status == "done" or .metadata.labels.status == "error") | .metadata.name')
+
+  # Collect running pods (only relevant if --include-running)
+  local running_pods=()
+  if [[ "$include_running" -eq 1 ]]; then
+    while IFS= read -r name; do
+      running_pods+=("$name")
+    done < <(echo "$pods_json" | jq -r '.items[] | select(.metadata.labels.status == "running") | .metadata.name')
+  fi
+
+  if [[ ${#done_pods[@]} -eq 0 && ${#running_pods[@]} -eq 0 ]]; then
+    echo "No pods to dismiss."
+    return 0
+  fi
+
+  if [[ ${#done_pods[@]} -gt 0 ]]; then
+    echo "Dismissing ${#done_pods[@]} done/error pod(s):"
+    for name in "${done_pods[@]}"; do
+      echo "  $name"
+    done
+    kubectl delete pod -n claude-workers "${done_pods[@]}"
+  fi
+
+  if [[ "$include_running" -eq 1 && ${#running_pods[@]} -gt 0 ]]; then
+    echo ""
+    printf "Also dismiss %d running pod(s)? [y/N] " "${#running_pods[@]}"
+    read -r answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+      for name in "${running_pods[@]}"; do
+        echo "  $name"
+      done
+      kubectl delete pod -n claude-workers "${running_pods[@]}"
+    else
+      echo "Skipped running pods."
+    fi
+  fi
+}
+
+# ─── ccw stop-all ─────────────────────────────────────────────────────────────
+cmd_stop_all() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: ccw stop-all"
+    echo ""
+    echo "Send SIGTERM to Claude in all running pods and mark them as stopped."
+    return 0
+  fi
+
+  require_cmd kubectl
+  require_cmd jq
+
+  local pods_json
+  pods_json="$(kubectl get pods -n claude-workers -l app=claude-worker -o json 2>/dev/null)"
+
+  local running_pods=()
+  while IFS= read -r name; do
+    running_pods+=("$name")
+  done < <(echo "$pods_json" | jq -r '.items[] | select(.metadata.labels.status == "running") | .metadata.name')
+
+  if [[ ${#running_pods[@]} -eq 0 ]]; then
+    echo "No running pods found."
+    return 0
+  fi
+
+  echo "Stopping ${#running_pods[@]} running pod(s):"
+  for name in "${running_pods[@]}"; do
+    echo -n "  $name ... "
+    kubectl exec -n claude-workers "$name" -- pkill -SIGTERM -f 'claude' 2>/dev/null || true
+    kubectl label pod -n claude-workers "$name" status=stopped --overwrite >/dev/null
+    echo "stopped"
+  done
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
   usage
@@ -408,8 +568,10 @@ case "$subcommand" in
   ssh)         cmd_ssh "$@" ;;
   shell)       cmd_shell "$@" ;;
   logs)        cmd_logs "$@" ;;
-  stop|dismiss|dismiss-all)
-    die "subcommand '${subcommand}' is not yet implemented" ;;
+  stop)        cmd_stop "$@" ;;
+  stop-all)    cmd_stop_all "$@" ;;
+  dismiss)     cmd_dismiss "$@" ;;
+  dismiss-all) cmd_dismiss_all "$@" ;;
   *)
     die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
 esac
