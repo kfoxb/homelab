@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CCW_NAMESPACE=claude-workers
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+# Print usage/help
+usage() {
+  cat <<EOF
+ccw — Claude Code Worker CLI
+
+Usage: ccw <subcommand> [options]
+
+Subcommands:
+  start        Start a new worker pod (--repo, --branch, [--ticket], --prompt)
+  list         List all worker pods
+  status       Show detailed status for a task
+  ssh          Attach to the Claude tmux session inside a task pod
+  shell        Open a plain bash shell inside a task pod
+  logs         Tail the Claude output log for a task
+  stop         Stop (kill) a running task pod
+  dismiss      Delete a finished or stopped task pod
+  dismiss-all  Delete all task pods in the namespace
+  help         Show this help message
+
+Examples:
+  ccw start --repo https://github.com/user/my-app --branch main --prompt "Summarize the README"
+  ccw list
+  ccw status my-app-20240315-a3f9
+  ccw ssh my-app-20240315-a3f9
+  ccw logs my-app-20240315-a3f9 --follow
+  ccw dismiss my-app-20240315-a3f9
+EOF
+}
+
+# Return the full pod name for a given task name (they are the same).
+# Validates that the pod exists in the namespace.
+pod_name() {
+  local task="$1"
+  kubectl get pod "$task" -n "$CCW_NAMESPACE" --no-headers -o name 2>/dev/null | sed 's|pod/||'
+}
+
+# Exit with an error message if the pod for <task> does not exist.
+require_task() {
+  local task="$1"
+  if ! kubectl get pod "$task" -n "$CCW_NAMESPACE" --no-headers &>/dev/null; then
+    echo "error: task pod '$task' not found in namespace '$CCW_NAMESPACE'" >&2
+    exit 1
+  fi
+}
+
+# Extract a label value from a pod via jsonpath.
+get_pod_label() {
+  local pod="$1"
+  local label="$2"
+  kubectl get pod "$pod" -n "$CCW_NAMESPACE" \
+    -o "jsonpath={.metadata.labels.$label}" 2>/dev/null
+}
+
+# Locate pod-template.yaml: honour $CCW_POD_TEMPLATE, else resolve relative to
+# this script's location (../pod-template.yaml).
+find_pod_template() {
+  if [[ -n "${CCW_POD_TEMPLATE:-}" ]]; then
+    echo "$CCW_POD_TEMPLATE"
+    return
+  fi
+  # Resolve the directory containing this script, even when called via a symlink.
+  local script_dir
+  script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  echo "$script_dir/../pod-template.yaml"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand dispatch
+# ---------------------------------------------------------------------------
+
+# Normalise missing first argument to "help"
+SUBCOMMAND="${1:-help}"
+shift || true  # shift may fail when $# == 0; that's fine
+
+case "$SUBCOMMAND" in
+  start)
+    # Implemented in ticket 2.2
+    echo "ccw start: not yet implemented" >&2
+    exit 1
+    ;;
+
+  list)
+    # Implemented in ticket 2.3
+    echo "ccw list: not yet implemented" >&2
+    exit 1
+    ;;
+
+  status)
+    # Implemented in ticket 2.4
+    echo "ccw status: not yet implemented" >&2
+    exit 1
+    ;;
+
+  ssh)
+    # Implemented in ticket 2.5
+    echo "ccw ssh: not yet implemented" >&2
+    exit 1
+    ;;
+
+  shell)
+    # Implemented in ticket 2.5
+    echo "ccw shell: not yet implemented" >&2
+    exit 1
+    ;;
+
+  logs)
+    # Implemented in ticket 2.6
+    echo "ccw logs: not yet implemented" >&2
+    exit 1
+    ;;
+
+  stop)
+    # Implemented in ticket 2.7
+    echo "ccw stop: not yet implemented" >&2
+    exit 1
+    ;;
+
+  dismiss)
+    # Implemented in ticket 2.7
+    echo "ccw dismiss: not yet implemented" >&2
+    exit 1
+    ;;
+
+  dismiss-all)
+    # Implemented in ticket 2.7
+    echo "ccw dismiss-all: not yet implemented" >&2
+    exit 1
+    ;;
+
+  help|--help|-h)
+    usage
+    ;;
+
+  *)
+    echo "error: unknown subcommand '$SUBCOMMAND'" >&2
+    echo >&2
+    usage >&2
+    exit 1
+    ;;
+esac
