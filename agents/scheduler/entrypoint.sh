@@ -28,4 +28,25 @@ while true; do
       echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Released: ${OLDEST}"
     fi
   fi
+
+  # Re-queue rate-limited pods whose cooldown has expired
+  NOW=$(date +%s)
+  RATE_LIMITED=$(kubectl get pods -n "${NAMESPACE}" -l status=rate-limited \
+    -o custom-columns='NAME:.metadata.name' \
+    --no-headers 2>/dev/null)
+
+  for POD in ${RATE_LIMITED}; do
+    RETRY_AFTER=$(kubectl get pod "${POD}" -n "${NAMESPACE}" \
+      -o jsonpath='{.metadata.annotations.ccw/retry-after}' 2>/dev/null || true)
+
+    # Skip pods with no retry-after annotation
+    if [ -z "${RETRY_AFTER}" ]; then
+      continue
+    fi
+
+    if [ "${NOW}" -gt "${RETRY_AFTER}" ]; then
+      kubectl label pod "${POD}" -n "${NAMESPACE}" status=queued --overwrite
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Re-queued after rate limit cooldown: ${POD}"
+    fi
+  done
 done
