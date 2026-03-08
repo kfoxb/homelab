@@ -26,6 +26,21 @@ Required fields:
 - `ANTHROPIC_API_KEY` — your Anthropic API key
 - `GITHUB_TOKEN` — a GitHub personal access token with repo read/write access
 
+## Configuration
+
+Queue scheduler settings are in `agents/worker-config.yaml` and stored in the `worker-config` ConfigMap.
+
+To change settings live (no restart required):
+
+```bash
+kubectl edit configmap worker-config -n claude-workers
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `maxConcurrent` | `"2"` | Maximum simultaneously running Claude sessions |
+| `rateLimitCooldownMinutes` | `"300"` | Minutes to wait after a rate limit before retrying (5 hours matches Claude's rolling window) |
+
 ## Planned
 
 - **Ticket triage**: CronJob that checks for newly assigned tickets,
