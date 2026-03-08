@@ -344,6 +344,53 @@ cmd_shell() {
   kubectl exec -it -n claude-workers "$task" -- bash
 }
 
+# ─── ccw logs ─────────────────────────────────────────────────────────────────
+cmd_logs() {
+  local task="" follow=0 lines=100
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --follow|-f) follow=1; shift ;;
+      --since)
+        lines="${2:-}"
+        [[ "$lines" =~ ^[0-9]+$ ]] || die "--since requires a numeric argument"
+        shift 2 ;;
+      --help|-h)
+        cat <<EOF
+Usage: ccw logs <task> [--follow] [--since <N>]
+
+Options:
+  --follow, -f   Stream new output as it arrives (tail -f)
+  --since <N>    Show last N lines (default: 100)
+EOF
+        return 0 ;;
+      -*)  die "unknown option: $1" ;;
+      *)
+        [[ -z "$task" ]] || die "unexpected argument: $1"
+        task="$1"; shift ;;
+    esac
+  done
+
+  [[ -n "$task" ]] || die "usage: ccw logs <task> [--follow] [--since <N>]"
+
+  require_cmd kubectl
+
+  kubectl get pod -n claude-workers "$task" >/dev/null 2>&1 \
+    || die "task not found: ${task}"
+
+  local log_path="/workspace/.claude-output.log"
+
+  if [[ "$follow" -eq 1 ]]; then
+    kubectl exec -n claude-workers "$task" -- \
+      tail -f "$log_path" 2>/dev/null \
+      || die "log file not found (pod may still be starting)"
+  else
+    kubectl exec -n claude-workers "$task" -- \
+      tail -n "$lines" "$log_path" 2>/dev/null \
+      || die "log file not found (pod may still be starting)"
+  fi
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
   usage
@@ -360,7 +407,8 @@ case "$subcommand" in
   status)      cmd_status "$@" ;;
   ssh)         cmd_ssh "$@" ;;
   shell)       cmd_shell "$@" ;;
-  logs|stop|dismiss|dismiss-all)
+  logs)        cmd_logs "$@" ;;
+  stop|dismiss|dismiss-all)
     die "subcommand '${subcommand}' is not yet implemented" ;;
   *)
     die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
