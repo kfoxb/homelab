@@ -125,6 +125,117 @@ EOF
   echo "To monitor:   ccw logs ${task_name} --follow"
 }
 
+# ─── ccw list ─────────────────────────────────────────────────────────────────
+cmd_list() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: ccw list"
+    echo ""
+    echo "List all Claude Code worker pods."
+    return 0
+  fi
+
+  require_cmd kubectl
+  require_cmd jq
+
+  # ── Color setup (only when stdout is a TTY)
+  local c_reset="" c_green="" c_red="" c_yellow="" c_blue="" c_dim=""
+  if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+    c_reset="$(tput sgr0)"
+    c_green="$(tput setaf 2)"
+    c_red="$(tput setaf 1)"
+    c_yellow="$(tput setaf 3)"
+    c_blue="$(tput setaf 4)"
+    c_dim="$(tput dim 2>/dev/null || true)"
+  fi
+
+  # ── Fetch pods as JSON
+  local pods_json
+  pods_json="$(kubectl get pods -n claude-workers -l app=claude-worker -o json 2>/dev/null)" || {
+    die "failed to query pods (is kubectl configured?)"
+  }
+
+  local pod_count
+  pod_count="$(echo "$pods_json" | jq '.items | length')"
+
+  # ── Header
+  printf "%-30s %-13s %-20s %-25s %-12s %-6s %s\n" \
+    "TASK" "STATUS" "REPO" "BRANCH" "TICKET" "AGE" "NODE"
+
+  if [[ "$pod_count" -eq 0 ]]; then
+    echo ""
+    echo "No worker pods found."
+    return 0
+  fi
+
+  # ── Format age from an ISO-8601 timestamp to Xm / Xh / Xd
+  # Usage: format_age <timestamp>
+  format_age() {
+    local ts="$1"
+    local now epoch_now epoch_ts diff_s
+
+    # Convert timestamp to epoch seconds (works on GNU date)
+    epoch_ts="$(date -d "$ts" +%s 2>/dev/null)" || epoch_ts="$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null)" || { echo "?"; return; }
+    epoch_now="$(date +%s)"
+    diff_s=$(( epoch_now - epoch_ts ))
+
+    if (( diff_s < 3600 )); then
+      echo "$(( diff_s / 60 ))m"
+    elif (( diff_s < 86400 )); then
+      echo "$(( diff_s / 3600 ))h"
+    else
+      echo "$(( diff_s / 86400 ))d"
+    fi
+  }
+
+  # ── Color a status value
+  color_status() {
+    local status="$1"
+    local colored
+    case "$status" in
+      running)      colored="${c_green}${status}${c_reset}" ;;
+      done)         colored="${c_dim}${status}${c_reset}" ;;
+      error)        colored="${c_red}${status}${c_reset}" ;;
+      rate-limited) colored="${c_yellow}${status}${c_reset}" ;;
+      queued)       colored="${c_blue}${status}${c_reset}" ;;
+      *)            colored="${status}" ;;
+    esac
+    echo "$colored"
+  }
+
+  # ── Iterate over pods
+  echo "$pods_json" | jq -c '.items[]' | while IFS= read -r pod; do
+    local name status repo branch ticket age node
+
+    name="$(echo "$pod" | jq -r '.metadata.name')"
+    status="$(echo "$pod" | jq -r '.metadata.labels.status // "unknown"')"
+    repo="$(echo "$pod" | jq -r '.metadata.labels.repo // "-"')"
+    branch="$(echo "$pod" | jq -r '.metadata.labels.branch // "-"')"
+    ticket="$(echo "$pod" | jq -r '.metadata.labels.ticket // ""')"
+    node="$(echo "$pod" | jq -r '.spec.nodeName // "-"')"
+
+    local created_at
+    created_at="$(echo "$pod" | jq -r '.metadata.creationTimestamp')"
+    age="$(format_age "$created_at")"
+
+    # Truncate long fields to keep columns readable
+    local repo_display branch_display ticket_display
+    repo_display="${repo:0:20}"
+    branch_display="${branch:0:25}"
+    ticket_display="${ticket:0:12}"
+
+    local colored_status
+    colored_status="$(color_status "$status")"
+
+    # STATUS is color-coded; account for invisible escape codes in printf width
+    local status_plain_len=${#status}
+    local status_colored_len=${#colored_status}
+    local pad=$(( 13 + status_colored_len - status_plain_len ))
+
+    printf "%-30s %-${pad}s %-20s %-25s %-12s %-6s %s\n" \
+      "$name" "$colored_status" "$repo_display" "$branch_display" "$ticket_display" "$age" "$node"
+  done
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
   usage
@@ -137,7 +248,8 @@ shift
 case "$subcommand" in
   start)       cmd_start "$@" ;;
   --help|-h)   usage ;;
-  list|status|ssh|shell|logs|stop|dismiss|dismiss-all)
+  list)        cmd_list "$@" ;;
+  status|ssh|shell|logs|stop|dismiss|dismiss-all)
     die "subcommand '${subcommand}' is not yet implemented" ;;
   *)
     die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
