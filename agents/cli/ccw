@@ -25,6 +25,7 @@ Subcommands:
   queue       Show queue status and manage concurrency
   follow-up   Send a follow-up message to a Claude session
   history     Show event history for a task (or all tasks)
+  feedback    Show branch info and send feedback to a task
 
 Run 'ccw <subcommand> --help' for subcommand-specific options.
 EOF
@@ -961,6 +962,107 @@ EOF
   fi
 }
 
+# ─── ccw feedback ─────────────────────────────────────────────────────────────
+cmd_feedback() {
+  local task="" message=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        cat <<EOF
+Usage: ccw feedback <task> [<message>]
+
+Show branch info for a task and send feedback to the Claude session.
+
+If <message> is omitted, \$EDITOR is opened for multi-line feedback.
+
+Examples:
+  ccw feedback my-app-20240315-a3f9 "fix the tests"
+  ccw feedback my-app-20240315-a3f9
+EOF
+        return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        if [[ -z "$task" ]]; then
+          task="$1"; shift
+        elif [[ -z "$message" ]]; then
+          message="$1"; shift
+        else
+          die "unexpected argument: $1"
+        fi ;;
+    esac
+  done
+
+  [[ -n "$task" ]] || die "usage: ccw feedback <task> [<message>]"
+
+  require_cmd kubectl
+
+  kubectl get pod -n claude-workers "$task" >/dev/null 2>&1 \
+    || die "task not found: ${task}"
+
+  # ── Fetch task metadata from pod labels
+  local pod_json
+  pod_json="$(kubectl get pod -n claude-workers "$task" -o json 2>/dev/null)"
+
+  local branch status
+  branch="$(echo "$pod_json" | jq -r '.metadata.labels.branch // "-"')"
+  status="$(echo "$pod_json" | jq -r '.metadata.labels.status // "unknown"')"
+
+  # ── Fetch latest commit info from git inside the pod
+  # Workspace path is /workspace/<repo-slug>; fall back to searching under /workspace
+  local repo_slug commit_info commit_count
+  repo_slug="$(echo "$pod_json" | jq -r '.metadata.labels.repo // ""')"
+
+  local workspace_path="/workspace/${repo_slug}"
+  commit_info="$(kubectl exec -n claude-workers "$task" -- \
+    bash -c "git -C '${workspace_path}' log --oneline -1 2>/dev/null \
+             || git -C /workspace log --oneline -1 2>/dev/null \
+             || echo '(no commits yet)'")" 2>/dev/null || commit_info="(unavailable)"
+
+  commit_count="$(kubectl exec -n claude-workers "$task" -- \
+    bash -c "git -C '${workspace_path}' rev-list --count HEAD 2>/dev/null \
+             || git -C /workspace rev-list --count HEAD 2>/dev/null \
+             || echo '?'")" 2>/dev/null || commit_count="?"
+
+  # ── Print metadata block
+  printf "\nTask:     %s\n" "$task"
+  printf "Branch:   %s\n" "$branch"
+  printf "Latest:   %s (%s commits)\n" "$commit_info" "$commit_count"
+  printf "Status:   %s\n\n" "$status"
+
+  # ── If no message provided, open $EDITOR for multi-line feedback
+  if [[ -z "$message" ]]; then
+    local tmpfile
+    tmpfile="$(mktemp --suffix=.txt)"
+    # shellcheck disable=SC2064
+    trap "rm -f '${tmpfile}'" EXIT
+
+    cat > "$tmpfile" <<'TEMPLATE'
+
+# Enter your feedback above. Lines starting with '#' are ignored.
+# Save and close to send. Exit without saving to abort.
+TEMPLATE
+
+    local editor="${EDITOR:-vi}"
+    "$editor" "$tmpfile"
+
+    # Read file, strip comment lines and leading/trailing blank lines
+    message="$(grep -v '^#' "$tmpfile" | sed '/./,$!d' | sed -e :a -e '/^\s*$/{$d;N;ba}')"
+
+    if [[ -z "$message" ]]; then
+      echo "No message entered. Aborted."
+      return 0
+    fi
+  fi
+
+  # ── Delegate to follow-up
+  echo "Sending feedback..."
+  cmd_follow_up "$task" "$message"
+
+  echo ""
+  echo "Claude is working on your feedback. Connect with: ccw ssh ${task}"
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
   usage
@@ -985,6 +1087,7 @@ case "$subcommand" in
   queue)       cmd_queue "$@" ;;
   follow-up)   cmd_follow_up "$@" ;;
   history)     cmd_history "$@" ;;
+  feedback)    cmd_feedback "$@" ;;
   *)
     die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
 esac
