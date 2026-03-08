@@ -16,15 +16,17 @@ Base container image for all Claude Code worker pods.
 
 ## Building
 
-### Prerequisites
+### One-time setup: authenticate to ghcr.io
 
-- Docker installed locally or on a cluster node
-- GitHub Container Registry access (`docker login ghcr.io`)
+You need a GitHub personal access token (classic or fine-grained) with `write:packages` scope.
 
 ```bash
-# One-time login
+# Create a token at https://github.com/settings/tokens
+export GITHUB_TOKEN=ghp_...
 echo $GITHUB_TOKEN | docker login ghcr.io -u <your-github-username> --password-stdin
 ```
+
+This only needs to be done once per machine. Docker stores the credentials in `~/.docker/config.json`.
 
 ### Build and push
 
@@ -32,16 +34,20 @@ echo $GITHUB_TOKEN | docker login ghcr.io -u <your-github-username> --password-s
 bash agents/base-image/build.sh
 ```
 
-This builds with a `latest` tag and a short SHA tag, then pushes both to ghcr.io.
+This builds with a `latest` tag and a short git-SHA tag, then pushes both to `ghcr.io/kfoxb/claude-worker`.
 
-See `build.sh` for the full command if you want to run steps manually.
+To override the org (e.g. if you've forked this repo under a different account):
+
+```bash
+GHCR_ORG=myorg bash agents/base-image/build.sh
+```
 
 ## Verification
 
 After building, verify the image works:
 
 ```bash
-IMAGE=ghcr.io/<org>/claude-worker:latest
+IMAGE=ghcr.io/kfoxb/claude-worker:latest
 
 docker run --rm $IMAGE claude --version
 docker run --rm $IMAGE tmux -V
