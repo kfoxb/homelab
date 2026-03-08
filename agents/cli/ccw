@@ -5,8 +5,29 @@ set -euo pipefail
 
 # ─── Resolve template paths ───────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-POD_TEMPLATE="${CCW_POD_TEMPLATE:-${SCRIPT_DIR}/../pod-template.yaml}"
-BUILD_JOB_TEMPLATE="${CCW_BUILD_JOB_TEMPLATE:-${SCRIPT_DIR}/../build-job-template.yaml}"
+
+# CCW_HOMELAB_DIR points to a cloned homelab repo. When ccw is installed via
+# dotfiles (not inside the repo), this env var tells ccw where to find the
+# agents/ directory and its templates. Defaults to ~/homelab.
+CCW_HOMELAB_DIR="${CCW_HOMELAB_DIR:-${HOME}/homelab}"
+
+# Template resolution order:
+#   1. Explicit env override (CCW_POD_TEMPLATE / CCW_BUILD_JOB_TEMPLATE)
+#   2. Relative to SCRIPT_DIR (running from inside the repo, e.g. during dev)
+#   3. CCW_HOMELAB_DIR (installed via dotfiles or standalone)
+_resolve_template() {
+  local explicit="$1" relative="$2" homelab_relative="$3"
+  if [[ -n "$explicit" ]]; then
+    echo "$explicit"
+  elif [[ -f "${SCRIPT_DIR}/${relative}" ]]; then
+    echo "${SCRIPT_DIR}/${relative}"
+  else
+    echo "${CCW_HOMELAB_DIR}/agents/${homelab_relative}"
+  fi
+}
+
+POD_TEMPLATE="$(_resolve_template "${CCW_POD_TEMPLATE:-}" "../pod-template.yaml" "pod-template.yaml")"
+BUILD_JOB_TEMPLATE="$(_resolve_template "${CCW_BUILD_JOB_TEMPLATE:-}" "../build-job-template.yaml" "build-job-template.yaml")"
 REGISTRY="${CCW_REGISTRY:-registry.claude-workers.svc.cluster.local:5000}"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
