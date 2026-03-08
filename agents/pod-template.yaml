@@ -7,7 +7,7 @@ metadata:
     app: claude-worker
     task: ${TASK_NAME}
     repo: ${REPO_SLUG}
-    branch: ${GIT_BRANCH}
+    branch: ${GIT_BRANCH_LABEL}
     ticket: ${LINEAR_TICKET}
     status: running
 spec:
@@ -16,7 +16,7 @@ spec:
 
   containers:
     - name: claude-worker
-      image: ghcr.io/kfoxb/claude-worker:latest
+      image: ${CLAUDE_IMAGE}
       envFrom:
         - secretRef:
             name: claude-worker-secrets
@@ -31,6 +31,9 @@ spec:
           value: "${GIT_BRANCH}"
         - name: LINEAR_TICKET
           value: "${LINEAR_TICKET}"
+        # Prompt is mounted as a file via ConfigMap (created by ccw start)
+        - name: CLAUDE_PROMPT_FILE
+          value: "/prompt/prompt.txt"
       resources:
         requests:
           cpu: 500m
@@ -41,7 +44,13 @@ spec:
       volumeMounts:
         - name: workspace
           mountPath: /workspace
+        - name: prompt
+          mountPath: /prompt
+          readOnly: true
 
   volumes:
     - name: workspace
       emptyDir: {}
+    - name: prompt
+      configMap:
+        name: ${TASK_NAME}-prompt

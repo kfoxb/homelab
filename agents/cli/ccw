@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# ccw — Claude Code Worker CLI
+# Wraps kubectl operations for managing Claude Code agent pods.
+set -euo pipefail
+
+# ─── Resolve pod template path ───────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+POD_TEMPLATE="${CCW_POD_TEMPLATE:-${SCRIPT_DIR}/../pod-template.yaml}"
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+Usage: ccw <subcommand> [options]
+
+Subcommands:
+  start       Start a new Claude Code worker task
+  list        List all worker pods
+  status      Show status of a task
+  ssh         Attach to the Claude tmux session in a task
+  shell       Open a bash shell in a task pod
+  logs        Tail logs from a task
+  stop        Gracefully stop a running task
+  dismiss     Delete a task pod
+  dismiss-all Delete all task pods
+
+Run 'ccw <subcommand> --help' for subcommand-specific options.
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not found in PATH"
+}
+
+# ─── ccw start ────────────────────────────────────────────────────────────────
+cmd_start() {
+  local repo="" branch="" prompt="" ticket="" image=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)    repo="$2";   shift 2 ;;
+      --branch)  branch="$2"; shift 2 ;;
+      --prompt)  prompt="$2"; shift 2 ;;
+      --ticket)  ticket="$2"; shift 2 ;;
+      --image)   image="$2";  shift 2 ;;
+      --help|-h)
+        cat <<EOF
+Usage: ccw start --repo <url> --branch <name> --prompt <text> [options]
+
+Options:
+  --repo    <url>    Git repository URL (required)
+  --branch  <name>  Branch to work on, created if absent (required)
+  --prompt  <text>  Initial prompt for Claude (required)
+  --ticket  <id>    Linear ticket ID (optional)
+  --image   <image> Override container image (optional)
+EOF
+        return 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  [[ -n "$repo"   ]] || die "--repo is required"
+  [[ -n "$branch" ]] || die "--branch is required"
+  [[ -n "$prompt" ]] || die "--prompt is required"
+
+  require_cmd kubectl
+  require_cmd envsubst
+
+  [[ -f "$POD_TEMPLATE" ]] || die "pod template not found: $POD_TEMPLATE"
+
+  # ── Derive repo slug from URL (last path component, lowercase, alnum+hyphens)
+  local raw_slug
+  raw_slug="$(basename "$repo" .git | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
+
+  # ── Generate task name: <slug>-<yyyymmdd>-<4-char-random>
+  # Fixed suffix length: -YYYYMMDD-XXXX = 14 chars; leave room for slug.
+  local date_suffix rand_suffix
+  date_suffix="$(date +%Y%m%d)"
+  rand_suffix="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c4)"
+
+  local max_slug_len=$(( 63 - 1 - ${#date_suffix} - 1 - ${#rand_suffix} ))
+  local slug="${raw_slug:0:$max_slug_len}"
+  # Strip trailing hyphens that may result from truncation
+  slug="${slug%-}"
+
+  local task_name="${slug}-${date_suffix}-${rand_suffix}"
+
+  # ── Sanitize branch name for use as a Kubernetes label value
+  # Label values: max 63 chars, [a-zA-Z0-9._-], must start/end with alphanum
+  local branch_label
+  branch_label="$(echo "$branch" | tr '/' '-' | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/^-//;s/-$//' | cut -c1-63)"
+
+  # ── Write prompt to temp file (avoids shell quoting issues with special chars)
+  local prompt_file
+  prompt_file="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$prompt_file'" EXIT
+  printf '%s' "$prompt" > "$prompt_file"
+
+  # ── Export variables consumed by envsubst + pod template
+  export TASK_NAME="$task_name"
+  export REPO_URL="$repo"
+  export REPO_SLUG="$raw_slug"
+  export GIT_BRANCH="$branch"
+  export GIT_BRANCH_LABEL="$branch_label"
+  export LINEAR_TICKET="${ticket:-none}"
+  export CLAUDE_IMAGE="${image:-ghcr.io/kfoxb/claude-worker:latest}"
+
+  # ── Create ConfigMap for the prompt (avoids YAML-injection of arbitrary text)
+  kubectl create configmap "${task_name}-prompt" \
+    -n claude-workers \
+    --from-file=prompt.txt="${prompt_file}" \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+  # ── Apply pod manifest
+  envsubst < "$POD_TEMPLATE" | kubectl apply -f -
+
+  echo ""
+  echo "Task started: ${task_name}"
+  echo "To connect:   ccw ssh ${task_name}"
+  echo "To monitor:   ccw logs ${task_name} --follow"
+}
+
+# ─── Dispatch ─────────────────────────────────────────────────────────────────
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+subcommand="$1"
+shift
+
+case "$subcommand" in
+  start)       cmd_start "$@" ;;
+  --help|-h)   usage ;;
+  list|status|ssh|shell|logs|stop|dismiss|dismiss-all)
+    die "subcommand '${subcommand}' is not yet implemented" ;;
+  *)
+    die "unknown subcommand '${subcommand}'. Run 'ccw --help' for usage." ;;
+esac
