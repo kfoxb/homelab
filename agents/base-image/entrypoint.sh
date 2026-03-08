@@ -3,6 +3,12 @@ set -euo pipefail
 
 SESSION_ID_FILE=/tmp/claude-session-id
 INITIAL_PROMPT_FILE=/tmp/claude-initial-prompt
+EVENTS_LOG=/workspace/.claude-events.log
+
+# ─── Event logger ─────────────────────────────────────────────────────────────
+log_event() {
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $@" >> "${EVENTS_LOG}"
+}
 
 # ─── Git credentials ─────────────────────────────────────────────────────────
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -20,11 +26,15 @@ while true; do
   sleep 5
 done
 echo "Released by scheduler, starting work..."
+mkdir -p /workspace
+log_event "STARTED task=${HOSTNAME} repo=${REPO_URL} branch=${GIT_BRANCH} ticket=${TICKET_ID:-}"
 
 # ─── Clone repo ───────────────────────────────────────────────────────────────
 echo "Cloning ${REPO_URL} ..."
+CLONE_START=${SECONDS}
 git clone "${REPO_URL}" /workspace
 cd /workspace
+log_event "CLONED repo=${REPO_URL} elapsed=$((SECONDS - CLONE_START))s"
 
 # ─── Checkout / create branch ─────────────────────────────────────────────────
 DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
@@ -33,9 +43,11 @@ DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
 if git ls-remote --exit-code --heads origin "${GIT_BRANCH}" > /dev/null 2>&1; then
   git checkout "${GIT_BRANCH}"
   git pull --ff-only origin "${GIT_BRANCH}" || true
+  log_event "BRANCH_CHECKED_OUT branch=${GIT_BRANCH} created=false"
 else
   echo "Branch '${GIT_BRANCH}' not found remotely — creating from '${DEFAULT_BRANCH}'"
   git checkout -b "${GIT_BRANCH}" "origin/${DEFAULT_BRANCH}"
+  log_event "BRANCH_CHECKED_OUT branch=${GIT_BRANCH} created=true"
 fi
 
 # ─── Write initial CLAUDE.md context if provided ──────────────────────────────
@@ -49,6 +61,13 @@ if [[ -n "${CLAUDE_PROMPT_FILE:-}" && -f "${CLAUDE_PROMPT_FILE}" ]]; then
   INITIAL_PROMPT=$(cat "${CLAUDE_PROMPT_FILE}")
 fi
 printf '%s' "${INITIAL_PROMPT}" > "${INITIAL_PROMPT_FILE}"
+
+# ─── Error handler ────────────────────────────────────────────────────────────
+_on_error() {
+  local lineno=$1
+  log_event "ERROR message=\"unexpected error at line ${lineno}\""
+}
+trap '_on_error ${LINENO}' ERR
 
 # ─── SIGTERM handler ──────────────────────────────────────────────────────────
 _shutdown() {
@@ -95,6 +114,8 @@ claude --dangerously-skip-permissions \
   while IFS= read -r line; do
     if echo "${line}" | jq -e '.subtype == "init"' >/dev/null 2>&1; then
       echo "${line}" | jq -r '.session_id' > "${SESSION_ID_FILE}"
+      SID=$(cat "${SESSION_ID_FILE}")
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) CLAUDE_STARTED session_id=${SID}" >> /workspace/.claude-events.log
     fi
     echo "${line}"
   done | tee /workspace/.claude-output.log
@@ -114,13 +135,14 @@ while true; do
     printf 'Continue where you left off.' > /tmp/claude-current-prompt.txt
     IS_RESUME=true
     echo "Resuming Claude session ${SESSION_ID}..."
-    # TODO(4.3): log RESUMED event to /workspace/.claude-events.log
+    log_event "RESUMED session_id=${SESSION_ID}"
   else
     cp "${INITIAL_PROMPT_FILE}" /tmp/claude-current-prompt.txt
     echo "Starting Claude Code with initial prompt..."
   fi
 
   rm -f /tmp/claude-exit-code /tmp/claude-done
+  CLAUDE_START=${SECONDS}
 
   # Start Claude in a tmux session so humans can exec in and observe
   tmux new-session -d -s claude /tmp/claude-launch.sh
@@ -134,8 +156,18 @@ while true; do
   if [[ -f /tmp/claude-exit-code ]]; then
     EXIT_CODE=$(cat /tmp/claude-exit-code)
   fi
+  log_event "CLAUDE_DONE exit_code=${EXIT_CODE} elapsed=$((SECONDS - CLAUDE_START))s"
 
   echo "${EXIT_CODE}" > /tmp/claude-done
+
+  # ── Follow-up queue ─────────────────────────────────────────────────────────
+  # Log if ccw follow-up queued a prompt while Claude was running.
+  # Queue consumption and re-launch are handled by ticket 4.4.
+  if [[ -f /tmp/follow-up-queue ]]; then
+    FOLLOW_UP_PROMPT=$(cat /tmp/follow-up-queue)
+    PREVIEW="${FOLLOW_UP_PROMPT:0:80}"
+    log_event "FOLLOW_UP prompt=\"${PREVIEW}\""
+  fi
 
   # ── Rate limit detection ────────────────────────────────────────────────────
   RATE_LIMITED=false
@@ -150,8 +182,10 @@ while true; do
     COOLDOWN=$(kubectl get configmap worker-config \
       -n "${POD_NAMESPACE:-claude-workers}" \
       -o jsonpath='{.data.rateLimitCooldownMinutes}' 2>/dev/null || echo "300")
+    RETRY_AFTER_ISO=$(date -u -d "+${COOLDOWN} minutes" +%Y-%m-%dT%H:%M:%SZ)
     RETRY_AFTER=$(date -d "+${COOLDOWN} minutes" +%s)
     echo "Rate limit hit — annotating pod with retry-after=${RETRY_AFTER}"
+    log_event "RATE_LIMITED retry_after=${RETRY_AFTER_ISO}"
     kubectl annotate pod "${HOSTNAME}" \
       -n "${POD_NAMESPACE:-claude-workers}" \
       "ccw/retry-after=${RETRY_AFTER}" \
