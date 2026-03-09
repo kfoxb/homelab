@@ -123,9 +123,9 @@ Before applying any manifests, ensure the following are in place:
 
 ### Secrets
 
-You need two API keys:
+You need the following credentials:
 
-- **`ANTHROPIC_API_KEY`** — from [console.anthropic.com](https://console.anthropic.com)
+- **`CLAUDE_CREDENTIALS`** — your Claude Pro/Max subscription credentials. Get this by running `cat ~/.claude/.credentials.json` on your laptop after logging in with `claude login`. The entire JSON object goes in the secret.
 - **`GITHUB_TOKEN`** — GitHub PAT with `repo` read/write scope (for cloning and PRs)
 
 Optionally, for Linear integration:
@@ -165,7 +165,9 @@ Copy the example and fill in your keys:
 
 ```bash
 cp agents/secrets.yaml.example agents/secrets.yaml
-# Edit agents/secrets.yaml — fill in ANTHROPIC_API_KEY and GITHUB_TOKEN
+# Edit agents/secrets.yaml:
+#   CLAUDE_CREDENTIALS: paste the output of: cat ~/.claude/.credentials.json
+#   GITHUB_TOKEN:       your GitHub PAT
 kubectl apply -f agents/secrets.yaml
 ```
 
