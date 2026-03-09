@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ─── Claude credentials (Pro/Max subscription) ───────────────────────────────
+# CLAUDE_CREDENTIALS holds the JSON content of ~/.claude/.credentials.json
+# from the user's local machine. Write it so Claude Code can authenticate.
+if [[ -n "${CLAUDE_CREDENTIALS:-}" ]]; then
+  mkdir -p ~/.claude
+  echo "${CLAUDE_CREDENTIALS}" > ~/.claude/.credentials.json
+  chmod 600 ~/.claude/.credentials.json
+else
+  echo "Warning: CLAUDE_CREDENTIALS not set — Claude Code will not be authenticated"
+fi
+
 # ─── Git credentials ─────────────────────────────────────────────────────────
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
   git config --global credential.helper store
