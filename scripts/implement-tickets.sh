@@ -95,7 +95,8 @@ ticket_done() {
 # stopping at the first gap (to preserve strict ordering).
 find_base_branch() {
   local last="$MAIN_BRANCH"
-  while IFS='|' read -r _phase ticket_json; do
+  # Use fd 4 here (fd 3 may be in use by the outer all-tickets loop in --all mode).
+  while IFS='|' read -r -u4 _phase ticket_json; do
     local id
     id=$(jq -r '.id' <<< "$ticket_json")
     if ticket_done "$id"; then
@@ -103,7 +104,7 @@ find_base_branch() {
     else
       break
     fi
-  done < <(all_tickets)
+  done 4< <(all_tickets)
   echo "$last"
 }
 
@@ -210,9 +211,11 @@ run_claude() {
   cd "$REPO_ROOT"
   # --dangerously-skip-permissions: auto-approve tool use (safe in this controlled context)
   # Default output format (text) is used so output is readable in the terminal.
+  # </dev/tty: explicitly bind stdin to the terminal so claude doesn't accidentally
+  # drain the all_tickets pipe that the outer while-read loop is consuming.
   claude --dangerously-skip-permissions \
          --max-turns 80 \
-         -p "$prompt"
+         -p "$prompt" </dev/tty
 }
 
 # ── Git operations ────────────────────────────────────────────────────────────
@@ -384,7 +387,7 @@ list_tickets() {
   printf '\n%-8s %-6s %s\n' "STATUS" "ID" "TITLE"
   printf '%-8s %-6s %s\n' "------" "----" "-----"
 
-  while IFS='|' read -r _phase ticket_json; do
+  while IFS='|' read -r -u3 _phase ticket_json; do
     local id title status_str
     id=$(jq -r '.id'       <<< "$ticket_json")
     title=$(jq -r '.title' <<< "$ticket_json")
@@ -398,7 +401,7 @@ list_tickets() {
     fi
 
     printf '%-8s %-6s %s\n' "$status_str" "$id" "$title"
-  done < <(all_tickets)
+  done 3< <(all_tickets)
 
   echo ""
   echo "Done: $done_count   Pending: $pending_count"
@@ -456,7 +459,7 @@ main() {
 
     next)
       local found=false
-      while IFS='|' read -r phase_dir ticket_json; do
+      while IFS='|' read -r -u3 phase_dir ticket_json; do
         local id
         id=$(jq -r '.id' <<< "$ticket_json")
         if ! ticket_done "$id"; then
@@ -464,7 +467,7 @@ main() {
           found=true
           break
         fi
-      done < <(all_tickets)
+      done 3< <(all_tickets)
 
       if ! $found; then
         echo "All tickets are already implemented."
@@ -473,14 +476,14 @@ main() {
 
     all)
       local count=0
-      while IFS='|' read -r phase_dir ticket_json; do
+      while IFS='|' read -r -u3 phase_dir ticket_json; do
         local id
         id=$(jq -r '.id' <<< "$ticket_json")
         if ! ticket_done "$id"; then
           implement_ticket "$phase_dir" "$ticket_json"
           count=$((count + 1))
         fi
-      done < <(all_tickets)
+      done 3< <(all_tickets)
 
       echo ""
       if [[ $count -eq 0 ]]; then
@@ -494,7 +497,7 @@ main() {
 
     specific)
       local found=false
-      while IFS='|' read -r phase_dir ticket_json; do
+      while IFS='|' read -r -u3 phase_dir ticket_json; do
         local id
         id=$(jq -r '.id' <<< "$ticket_json")
         if [[ "$id" == "$TARGET_TICKET" ]]; then
@@ -507,7 +510,7 @@ main() {
           found=true
           break
         fi
-      done < <(all_tickets)
+      done 3< <(all_tickets)
 
       if ! $found; then
         echo "Ticket '$TARGET_TICKET' not found in any phase."
