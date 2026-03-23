@@ -29,10 +29,30 @@ kubectl -n longhorn-system port-forward svc/longhorn-frontend 8080:80
 setup/          - Cluster bootstrap scripts
 longhorn/       - Longhorn storage values
 k3s-overrides/  - Overrides for K3s defaults
-agents/         - Claude Code agent Jobs and CronJobs
+agents/         - Claude Code agent infrastructure and CLI
 apps/           - Application workloads
 adguard/        - AdGuard Home docs (runs outside cluster on Rock64)
 ```
+
+## Claude Code Agents
+
+The `agents/` directory contains infrastructure for running Claude Code agents as Kubernetes pods. Agents run autonomously — you describe a task in plain English and they work in the background, committing code to a branch when done.
+
+```bash
+# Start a task
+ccw start \
+  --repo https://github.com/myorg/myapp \
+  --branch feat/my-feature \
+  --prompt "Implement X"
+
+# Watch what Claude is doing
+ccw ssh <task>
+
+# See all tasks
+ccw dashboard
+```
+
+See [agents/README.md](agents/README.md) for full setup instructions, CLI reference, and troubleshooting.
 
 ## Nodes
 
